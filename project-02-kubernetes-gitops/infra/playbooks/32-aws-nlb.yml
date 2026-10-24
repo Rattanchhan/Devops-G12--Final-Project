@@ -1,0 +1,151 @@
+---
+- name: Connect the existing AWS NLB to Traefik workload nodes
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../../../project-01-ansible-tooling/inventories/dev/group_vars/all/main.yml
+    - ../platform-config.yml
+  vars:
+    traefik_workload_nodes: [master02, worker01, worker02]
+  tasks:
+    - name: Find the existing NLB
+      ansible.builtin.command:
+        argv:
+          - aws
+          - elbv2
+          - describe-load-balancers
+          - --names
+          - "{{ aws_nlb_name }}"
+          - --region
+          - "{{ aws_region }}"
+          - --output
+          - json
+      changed_when: false
+      register: nlb_query
+
+    - name: Decode NLB details
+      ansible.builtin.set_fact:
+        nlb: "{{ (nlb_query.stdout | from_json).LoadBalancers[0] }}"
+
+    - name: Validate the selected public NLB and workload inventory
+      ansible.builtin.assert:
+        that:
+          - nlb.VpcId == aws_vpc_id
+          - nlb.Type == 'network'
+          - nlb.Scheme == 'internet-facing'
+          - nlb.State.Code == 'active'
+          - traefik_workload_nodes | difference(groups['kube_node']) | length == 0
+          - "'master01' not in traefik_workload_nodes"
+
+    - name: Read the shared VPC
+      amazon.aws.ec2_vpc_net_info:
+        region: "{{ aws_region }}"
+        vpc_ids: ["{{ aws_vpc_id }}"]
+      register: shared_vpc
+
+    - name: Create a dedicated public security group for the NLB
+      amazon.aws.ec2_security_group:
+        name: devops-g12-p2-nlb
+        description: Public HTTP and HTTPS for the Project 02 ingress NLB
+        region: "{{ aws_region }}"
+        vpc_id: "{{ aws_vpc_id }}"
+        rules:
+          - {proto: tcp, ports: [80, 443], cidr_ip: 0.0.0.0/0, rule_desc: Public web ingress}
+        rules_egress:
+          - {proto: -1, cidr_ip: 0.0.0.0/0}
+        state: present
+      register: nlb_security_group
+
+    - name: Build private-IP target lists for three workload nodes
+      ansible.builtin.set_fact:
+        traefik_http_targets: >-
+          {{ (traefik_http_targets | default([])) +
+             [{'Id': hostvars[item].ip, 'Port': traefik_http_node_port}] }}
+        traefik_https_targets: >-
+          {{ (traefik_https_targets | default([])) +
+             [{'Id': hostvars[item].ip, 'Port': traefik_https_node_port}] }}
+      loop: "{{ traefik_workload_nodes }}"
+
+    - name: Allow NLB traffic to Traefik NodePorts through the reused security group
+      amazon.aws.ec2_security_group:
+        name: "{{ project_tag }}-{{ target_environment }}"
+        description: Project 01 restricted ingress reused by Project 02 Kubernetes
+        region: "{{ aws_region }}"
+        vpc_id: "{{ aws_vpc_id }}"
+        purge_rules: false
+        purge_rules_egress: false
+        rules:
+          - proto: tcp
+            ports: ["{{ traefik_http_node_port }}", "{{ traefik_https_node_port }}"]
+            cidr_ip: "{{ shared_vpc.vpcs[0].cidr_block }}"
+            rule_desc: Project 02 NLB to Traefik NodePorts
+
+    - name: Create HTTP target group and register three workload nodes
+      community.aws.elb_target_group:
+        name: project02-traefik-http
+        region: "{{ aws_region }}"
+        protocol: TCP
+        port: "{{ traefik_http_node_port }}"
+        vpc_id: "{{ aws_vpc_id }}"
+        target_type: ip
+        health_check_protocol: TCP
+        targets: "{{ traefik_http_targets }}"
+        state: present
+        wait: false
+
+    - name: Create HTTPS target group and register three workload nodes
+      community.aws.elb_target_group:
+        name: project02-traefik-https
+        region: "{{ aws_region }}"
+        protocol: TCP
+        port: "{{ traefik_https_node_port }}"
+        vpc_id: "{{ aws_vpc_id }}"
+        target_type: ip
+        health_check_protocol: TCP
+        targets: "{{ traefik_https_targets }}"
+        state: present
+        wait: false
+
+    - name: Reconcile public HTTP and HTTPS listeners
+      community.aws.elb_network_lb:
+        name: "{{ aws_nlb_name }}"
+        region: "{{ aws_region }}"
+        subnets: "{{ nlb.AvailabilityZones | map(attribute='SubnetId') | list }}"
+        listeners:
+          - Protocol: TCP
+            Port: 80
+            DefaultActions:
+              - Type: forward
+                TargetGroupName: project02-traefik-http
+          - Protocol: TCP
+            Port: 443
+            DefaultActions:
+              - Type: forward
+                TargetGroupName: project02-traefik-https
+        purge_listeners: false
+        state: present
+
+    - name: Attach only the dedicated web security group to the NLB
+      ansible.builtin.command:
+        argv:
+          - aws
+          - elbv2
+          - set-security-groups
+          - --load-balancer-arn
+          - "{{ nlb.LoadBalancerArn }}"
+          - --security-groups
+          - "{{ nlb_security_group.group_id }}"
+          - --region
+          - "{{ aws_region }}"
+      when: nlb.SecurityGroups | default([]) != [nlb_security_group.group_id]
+
+    - name: Confirm required public DNS records resolve
+      ansible.builtin.getent:
+        database: ahostsv4
+        key: "{{ item }}"
+      loop:
+        - "{{ headlamp_domain }}"
+        - "{{ argocd_domain }}"
+        - "{{ application_domain }}"
+      changed_when: false

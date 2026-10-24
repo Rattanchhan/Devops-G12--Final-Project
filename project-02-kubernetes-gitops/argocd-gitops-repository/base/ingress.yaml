@@ -1,0 +1,16 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: react-demo
+  annotations: {cert-manager.io/cluster-issuer: letsencrypt-prod}
+spec:
+  ingressClassName: traefik
+  tls: [{hosts: [reactjs.trsd.tech], secretName: react-demo-tls}]
+  rules:
+    - host: reactjs.trsd.tech
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: {service: {name: react-demo, port: {name: http}}}
+

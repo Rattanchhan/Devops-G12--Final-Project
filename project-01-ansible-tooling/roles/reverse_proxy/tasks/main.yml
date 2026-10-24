@@ -1,0 +1,50 @@
+---
+- name: Install NGINX and Certbot
+  ansible.builtin.apt:
+    name: [nginx, certbot]
+    state: present
+- name: Remove default NGINX site
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: Reload NGINX
+- name: Create ACME webroot
+  ansible.builtin.file:
+    path: /var/www/acme
+    state: directory
+    owner: www-data
+    group: www-data
+    mode: "0755"
+- name: Install HTTP bootstrap virtual host
+  ansible.builtin.template:
+    src: http.conf.j2
+    dest: "/etc/nginx/sites-available/{{ service_domain }}.conf"
+    mode: "0644"
+  notify: Reload NGINX
+- name: Enable service virtual host
+  ansible.builtin.file:
+    src: "/etc/nginx/sites-available/{{ service_domain }}.conf"
+    dest: "/etc/nginx/sites-enabled/{{ service_domain }}.conf"
+    state: link
+  notify: Reload NGINX
+- name: Apply HTTP configuration before ACME
+  ansible.builtin.meta: flush_handlers
+- name: Obtain or renew certificate
+  ansible.builtin.command:
+    cmd: >-
+      certbot certonly --webroot --webroot-path /var/www/acme
+      --domain {{ service_domain }} --email {{ letsencrypt_email }}
+      --agree-tos --non-interactive --keep-until-expiring
+  args:
+    creates: "/etc/letsencrypt/live/{{ service_domain }}/fullchain.pem"
+- name: Install HTTPS virtual host
+  ansible.builtin.template:
+    src: https.conf.j2
+    dest: "/etc/nginx/sites-available/{{ service_domain }}.conf"
+    mode: "0644"
+  notify: Reload NGINX
+- name: Enable certificate renewal timer
+  ansible.builtin.systemd:
+    name: certbot.timer
+    state: started
+    enabled: true

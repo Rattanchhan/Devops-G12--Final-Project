@@ -1,0 +1,72 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: headlamp-viewer
+  namespace: headlamp
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: headlamp-namespace-reader
+rules:
+  # Headlamp discovers the namespaces available to the signed-in identity
+  # before loading their namespaced resources. Without this rule the UI cannot
+  # navigate to react-dev/react-prod even though RoleBindings exist there.
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, watch]
+  # Nodes are cluster-scoped, so the namespaced `view` bindings below cannot
+  # authorize Headlamp's Nodes page or dashboard node queries.
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+  # The Headlamp overview requests CPU and memory usage from Metrics Server.
+  # Node metrics are cluster-scoped and require a separate API-group rule.
+  - apiGroups: [metrics.k8s.io]
+    resources: [nodes]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: headlamp-namespace-reader
+subjects:
+  - kind: ServiceAccount
+    name: headlamp-viewer
+    namespace: headlamp
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: headlamp-namespace-reader
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: headlamp-viewer
+  namespace: react-dev
+subjects:
+  - kind: ServiceAccount
+    name: headlamp-viewer
+    namespace: headlamp
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  # Kubernetes' built-in view role covers namespaced workload resources,
+  # including Pods, Services, Deployments, ReplicaSets, Jobs, and Ingresses,
+  # while deliberately excluding Secrets and write operations.
+  name: view
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: headlamp-viewer
+  namespace: react-prod
+subjects:
+  - kind: ServiceAccount
+    name: headlamp-viewer
+    namespace: headlamp
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view

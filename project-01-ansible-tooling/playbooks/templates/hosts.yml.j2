@@ -1,0 +1,26 @@
+---
+all:
+  vars:
+    ansible_user: {{ ansible_user }}
+    ansible_ssh_private_key_file: {{ aws_ssh_private_key_file | to_json }}
+    ansible_ssh_common_args: {{ ('-o StrictHostKeyChecking=yes -o UserKnownHostsFile=' + playbook_dir + '/../inventories/dev/known_hosts') | to_json }}
+  hosts:
+{% for instance in project_instances %}
+    {{ instance.name }}:
+      ansible_host: {{ project_eip_addresses[instance.name].public_ip }}
+      private_ip: {{ project_instance_details[instance.name].private_ip_address }}
+      service_group: {{ instance.group }}
+{% endfor %}
+  children:
+    tooling:
+      hosts:
+{% for instance in project_instances %}
+        {{ instance.name }}:
+{% endfor %}
+{% for service_group in ['jenkins', 'sonarqube', 'nexus', 'build_agents'] %}
+    {{ service_group }}:
+      hosts:
+{% for instance in project_instances if instance.group == service_group %}
+        {{ instance.name }}:
+{% endfor %}
+{% endfor %}

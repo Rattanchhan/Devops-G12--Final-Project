@@ -1,0 +1,47 @@
+jenkins:
+  systemMessage: "Project 01 Jenkins managed by Ansible/JCasC"
+  numExecutors: 0
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: admin
+          password: "${JENKINS_ADMIN_PASSWORD}"
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+  nodes:
+    - permanent:
+        name: agent01
+        labelString: "linux project01-agent"
+        numExecutors: 1
+        remoteFS: /var/lib/jenkins-agent
+        launcher:
+          ssh:
+            host: "{{ hostvars['agent01'].private_ip }}"
+            port: 22
+            credentialsId: agent01-ssh
+            sshHostKeyVerificationStrategy:
+              manuallyTrustedKeyVerificationStrategy:
+                requireInitialManualTrust: true
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - basicSSHUserPrivateKey:
+              scope: SYSTEM
+              id: agent01-ssh
+              username: jenkins-agent
+              privateKeySource:
+                directEntry:
+                  privateKey: "${JENKINS_AGENT_PRIVATE_KEY}"
+jobs:
+  - script: |
+      freeStyleJob('agent-smoke-test') {
+        label('project01-agent')
+        steps {
+          shell('uname -a && java -version && git --version && echo verified > smoke-result.txt')
+        }
+        publishers { archiveArtifacts('smoke-result.txt') }
+      }
+

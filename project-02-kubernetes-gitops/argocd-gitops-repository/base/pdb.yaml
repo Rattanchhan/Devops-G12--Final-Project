@@ -1,0 +1,5 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: react-demo}
+spec: {minAvailable: 1, selector: {matchLabels: {app.kubernetes.io/name: react-demo}}}
+

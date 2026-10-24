@@ -1,0 +1,19 @@
+deployment:
+  replicas: 2
+ingressClass:
+  enabled: true
+  isDefaultClass: true
+service:
+  # Traffic arrives through the pre-existing AWS NLB configured by Ansible.
+  type: NodePort
+ports:
+  web:
+    nodePort: 30080
+  websecure:
+    nodePort: 30443
+    tls: {enabled: true}
+podDisruptionBudget: {enabled: true, minAvailable: 1}
+resources:
+  requests: {cpu: 100m, memory: 128Mi}
+  limits: {cpu: 500m, memory: 512Mi}
+

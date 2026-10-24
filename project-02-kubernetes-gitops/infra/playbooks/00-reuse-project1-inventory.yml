@@ -1,0 +1,43 @@
+---
+- name: Build the Project 02 inventory from existing Project 01 instances
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    project1_inventory_path: >-
+      {{ playbook_dir }}/../../../project-01-ansible-tooling/inventories/dev/hosts.yml
+    project2_inventory_path: >-
+      {{ playbook_dir }}/../kubespray/inventory/project02/hosts.yml
+    project1_node_mapping:
+      master01: ci01
+      master02: quality01
+      worker01: artifacts01
+      worker02: agent01
+  tasks:
+    - name: Load the completed Project 01 inventory by reference
+      ansible.builtin.include_vars:
+        file: "{{ project1_inventory_path }}"
+        name: project1_inventory
+
+    - name: Validate the four reusable Project 01 instances
+      ansible.builtin.assert:
+        that:
+          - project1_inventory.all.hosts | length == 4
+          - project1_node_mapping.values() | difference(project1_inventory.all.hosts.keys()) | length == 0
+          - project1_inventory.all.vars.ansible_user | length > 0
+          - project1_inventory.all.vars.ansible_ssh_private_key_file | length > 0
+          - project1_inventory.all.vars.ansible_ssh_common_args | length > 0
+        fail_msg: Project 01 must contain ci01, quality01, artifacts01 and agent01.
+
+    - name: Generate Kubespray inventory from the existing instances
+      ansible.builtin.template:
+        src: templates/reused-project1-hosts.yml.j2
+        dest: "{{ project2_inventory_path }}"
+        mode: "0600"
+
+    - name: Report the reused instance mapping
+      ansible.builtin.debug:
+        msg: "{{ item.key }} reuses Project 01 host {{ item.value }}"
+      loop: "{{ project1_node_mapping | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"

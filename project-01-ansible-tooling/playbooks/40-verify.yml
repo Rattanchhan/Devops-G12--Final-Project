@@ -1,0 +1,50 @@
+---
+- name: Verify hosts and services
+  hosts: tooling
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Check required command versions
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - git --version
+        - tree --version
+        - gh --version
+        - zsh --version
+        - docker --version
+      changed_when: false
+
+    - name: Check Docker containers
+      community.docker.docker_container_info:
+        name: "{{ item }}"
+      loop: "{{ service_containers | default([]) }}"
+      register: container_checks
+
+    - name: Assert expected containers are running
+      ansible.builtin.assert:
+        that:
+          - item.exists
+          - item.container.State.Running
+      loop: "{{ container_checks.results }}"
+      when: service_containers | default([]) | length > 0
+
+- name: Verify HTTPS endpoints from controller
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../inventories/dev/group_vars/all/main.yml
+  tasks:
+    - name: Request each HTTPS endpoint
+      ansible.builtin.uri:
+        url: "https://{{ item }}"
+        method: GET
+        validate_certs: true
+        status_code: [200, 302, 403]
+      loop:
+        - "{{ jenkins_domain }}"
+        - "{{ sonarqube_domain }}"
+        - "{{ nexus_domain }}"
+
+- name: Include required tooling verification
+  ansible.builtin.import_playbook: 41-verify-tooling.yml

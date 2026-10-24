@@ -1,0 +1,21 @@
+name: validate-infra
+on: [pull_request, push]
+permissions: {contents: read}
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: pip install ansible-lint==24.12.2
+      - run: pip install -r infra/kubespray/requirements.txt
+      - run: ansible-galaxy collection install -r infra/requirements.yml
+      - run: cp infra/kubespray/inventory/project02/hosts.yml.example infra/kubespray/inventory/project02/hosts.yml
+      - run: cp infra/inventories/lab/group_vars/all/cloud.yml.example infra/inventories/lab/group_vars/all/cloud.yml
+      - run: cp infra/platform-config.yml.example infra/platform-config.yml
+      - run: cp infra/vault.yml.example infra/vault.yml
+      - run: ansible-lint infra/playbooks
+      - run: kubectl kustomize argocd-repository/environments/dev >/dev/null
+      - run: kubectl kustomize argocd-repository/environments/prod >/dev/null
+

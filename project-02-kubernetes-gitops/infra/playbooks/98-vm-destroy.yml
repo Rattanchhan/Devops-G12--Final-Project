@@ -1,0 +1,44 @@
+---
+- name: Destroy only tagged Project 02 lab nodes
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../../../project-01-ansible-tooling/inventories/dev/group_vars/all/main.yml
+    - ../inventories/lab/group_vars/all/cloud.yml
+  vars:
+    confirm_destroy: false
+  tasks:
+    - name: Validate destruction scope
+      ansible.builtin.assert:
+        that:
+          - project_tag == 'devops-g12-p2'
+          - target_environment == 'lab'
+    - name: Discover exact tagged candidates
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Project": "{{ project_tag }}"
+          "tag:Environment": "{{ target_environment }}"
+          "tag:ManagedBy": Ansible
+          instance-state-name: [pending, running, stopping, stopped]
+      register: candidates
+    - name: Print destruction candidates
+      ansible.builtin.debug:
+        msg: "{{ candidates.instances | map(attribute='instance_id') | list }}"
+    - name: Require explicit confirmation after inspection
+      ansible.builtin.assert:
+        that: confirm_destroy | bool
+        fail_msg: Review the instance IDs and rerun with -e confirm_destroy=true.
+    - name: Terminate confirmed instances
+      amazon.aws.ec2_instance:
+        region: "{{ aws_region }}"
+        instance_ids: "{{ candidates.instances | map(attribute='instance_id') | list }}"
+        state: absent
+        wait: true
+      when: candidates.instances | length > 0
+    - name: Remove project security group
+      amazon.aws.ec2_security_group:
+        name: "{{ cluster_security_group_name }}"
+        region: "{{ aws_region }}"
+        state: absent

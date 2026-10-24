@@ -1,0 +1,24 @@
+---
+- name: Deploy Jenkins controller
+  hosts: jenkins
+  become: true
+  roles:
+    - role: jenkins
+
+- name: Deploy SonarQube
+  hosts: sonarqube
+  become: true
+  roles:
+    - role: sonarqube
+
+- name: Deploy Nexus Repository
+  hosts: nexus
+  become: true
+  roles:
+    - role: nexus
+
+- name: Configure dedicated Jenkins agents
+  hosts: build_agents
+  become: true
+  roles:
+    - role: build_agent

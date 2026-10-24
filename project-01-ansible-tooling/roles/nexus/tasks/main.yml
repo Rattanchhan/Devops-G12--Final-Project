@@ -1,0 +1,118 @@
+---
+- name: Validate Nexus bootstrap secret
+  ansible.builtin.assert:
+    that: vault_nexus_admin_password != 'CHANGE_ME'
+    fail_msg: Configure and encrypt vault_nexus_admin_password.
+- name: Create Nexus project directory
+  ansible.builtin.file:
+    path: /opt/nexus
+    state: directory
+    mode: "0750"
+- name: Render Nexus Compose project
+  ansible.builtin.template:
+    src: compose.yml.j2
+    dest: /opt/nexus/compose.yml
+    mode: "0640"
+  notify: Reconcile Nexus
+- name: Reconcile Nexus now
+  ansible.builtin.meta: flush_handlers
+- name: Wait for Nexus API
+  ansible.builtin.uri:
+    url: http://127.0.0.1:8081/service/rest/v1/status
+    status_code: 200
+  register: nexus_status
+  retries: 30
+  delay: 10
+  until: nexus_status.status == 200
+- name: Check configured Nexus administrator credentials
+  ansible.builtin.uri:
+    url: http://127.0.0.1:8081/service/rest/v1/security/users
+    user: admin
+    password: "{{ vault_nexus_admin_password }}"
+    force_basic_auth: true
+  register: nexus_configured_auth
+  failed_when: false
+  no_log: true
+- name: Read generated Nexus admin password
+  community.docker.docker_container_exec:
+    container: nexus
+    command: cat /nexus-data/admin.password
+  register: nexus_initial_password
+  changed_when: false
+  failed_when: false
+  when: nexus_configured_auth.status != 200
+  no_log: true
+- name: Check initial Nexus administrator credentials
+  ansible.builtin.uri:
+    url: http://127.0.0.1:8081/service/rest/v1/security/users
+    user: admin
+    password: "{{ nexus_initial_password.stdout | trim }}"
+    force_basic_auth: true
+  register: nexus_initial_auth
+  failed_when: false
+  when:
+    - nexus_configured_auth.status != 200
+    - nexus_initial_password.rc | default(1) == 0
+    - nexus_initial_password.stdout | default('') | length > 0
+  no_log: true
+- name: Validate known Nexus administrator credentials
+  ansible.builtin.assert:
+    that:
+      - >-
+        nexus_configured_auth.status == 200 or
+        nexus_initial_auth.status | default(0) == 200
+    fail_msg: >-
+      Neither the configured Vault password nor the generated bootstrap password
+      can authenticate the Nexus administrator. Update
+      vault_nexus_admin_password to the current administrator password.
+- name: Rotate initial Nexus admin password
+  ansible.builtin.uri:
+    url: http://127.0.0.1:8081/service/rest/v1/security/users/admin/change-password
+    method: PUT
+    user: admin
+    password: "{{ nexus_initial_password.stdout | trim }}"
+    force_basic_auth: true
+    body: "{{ vault_nexus_admin_password }}"
+    body_format: raw
+    headers:
+      Content-Type: text/plain
+  register: nexus_password_rotation
+  failed_when: false
+  changed_when: nexus_password_rotation.status | default(0) == 204
+  when: nexus_configured_auth.status != 200
+  no_log: true
+- name: Validate Nexus administrator password rotation
+  ansible.builtin.assert:
+    that:
+      - nexus_password_rotation.status | default(0) == 204
+    fail_msg: >-
+      Nexus rejected the administrator password rotation with HTTP status
+      {{ nexus_password_rotation.status | default('unknown') }}. Check the Nexus
+      container logs and verify that vault_nexus_admin_password satisfies any
+      configured Nexus password policy.
+  when: nexus_configured_auth.status != 200
+- name: Check Maven releases repository
+  ansible.builtin.uri:
+    url: http://127.0.0.1:8081/service/rest/v1/repositories/maven/hosted/releases
+    user: admin
+    password: "{{ vault_nexus_admin_password }}"
+    force_basic_auth: true
+    status_code: [200, 404]
+  register: nexus_releases_repository
+  no_log: true
+- name: Create Maven releases repository
+  ansible.builtin.uri:
+    url: http://127.0.0.1:8081/service/rest/v1/repositories/maven/hosted
+    method: POST
+    user: admin
+    password: "{{ vault_nexus_admin_password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      name: releases
+      online: true
+      storage: {blobStoreName: default, strictContentTypeValidation: true, writePolicy: ALLOW_ONCE}
+      maven: {versionPolicy: RELEASE, layoutPolicy: STRICT, contentDisposition: INLINE}
+    status_code: 201
+  when: nexus_releases_repository.status == 404
+  no_log: true

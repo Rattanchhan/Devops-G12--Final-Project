@@ -1,0 +1,157 @@
+---
+- name: Secure and bootstrap Argo CD
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files: [../platform-config.yml]
+  vars:
+    kubeconfig_path: "{{ lookup('env', 'KUBECONFIG') }}"
+    root_dir: "{{ playbook_dir }}/../.."
+  tasks:
+    - name: Check for an encrypted local vault
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../vault.yml"
+      register: local_vault
+      tags: [credentials]
+    - name: Load encrypted bootstrap secrets
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../vault.yml"
+      when: local_vault.stat.exists
+      no_log: true
+      tags: [credentials]
+    - name: Validate bootstrap inputs
+      ansible.builtin.assert:
+        that:
+          - kubeconfig_path | length > 0
+          - vault_argocd_webhook_secret | default('') | length >= 32
+          - vault_github_webhook_token | default('') | length > 0
+          - "'OWNER/REPOSITORY' not in gitops_repository_url"
+          - "'OWNER/' not in gitops_repository_url"
+          - "'CHANGE_ME' not in vault_argocd_webhook_secret"
+          - "'CHANGE_ME' not in vault_github_webhook_token"
+      tags: [credentials]
+    - name: Apply the Argo CD webhook shared secret
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: patched
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata: {name: argocd-secret, namespace: argocd}
+          stringData:
+            webhook.github.secret: "{{ vault_argocd_webhook_secret }}"
+      no_log: true
+      tags: [credentials]
+    - name: Register public GitOps repository
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: react-demo-gitops-repository
+            namespace: argocd
+            labels: {argocd.argoproj.io/secret-type: repository}
+          stringData: >-
+            {{ {'type': 'git', 'url': gitops_repository_url} |
+               combine((vault_gitops_read_token | default('') | length > 0) |
+                 ternary({'username': vault_gitops_username,
+                          'password': vault_gitops_read_token}, {})) }}
+    - name: Create scoped Argo CD project
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        definition: "{{ lookup('template', root_dir + '/argocd-gitops-repository/bootstrap/project.yaml.j2') | from_yaml }}"
+    - name: Create React development application
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        definition: "{{ lookup('template', root_dir + '/argocd-gitops-repository/bootstrap/application-dev.yaml.j2') | from_yaml }}"
+    - name: Create React production application
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        definition: "{{ lookup('template', root_dir + '/argocd-gitops-repository/bootstrap/application-prod.yaml.j2') | from_yaml }}"
+    - name: Read existing GitHub repository webhooks
+      ansible.builtin.uri:
+        url: "https://api.github.com/repos/{{ gitops_repository_slug }}/hooks?per_page=100"
+        method: GET
+        headers:
+          Accept: application/vnd.github+json
+          Authorization: "Bearer {{ vault_github_webhook_token }}"
+          X-GitHub-Api-Version: "2022-11-28"
+        return_content: true
+      register: existing_github_webhooks
+      changed_when: false
+      failed_when: false
+      no_log: true
+      tags: [credentials]
+    - name: Validate GitHub webhook API access
+      ansible.builtin.assert:
+        that:
+          - existing_github_webhooks.status | default(-1) == 200
+        fail_msg: >-
+          GitHub webhook API access failed for {{ gitops_repository_slug }}.
+          HTTP status={{ existing_github_webhooks.status | default('unknown') }};
+          message={{ (existing_github_webhooks.json | default({})).message |
+                     default(existing_github_webhooks.msg) |
+                     default('No response from GitHub') }}.
+          Verify gitops_repository_slug and give vault_github_webhook_token
+          access to this repository with repository Webhooks read/write.
+      tags: [credentials]
+    - name: Select the existing Argo CD webhook
+      ansible.builtin.set_fact:
+        existing_argocd_webhook: >-
+          {{ existing_github_webhooks.json |
+             selectattr('config.url', 'equalto',
+                        'https://' + argocd_domain + '/api/webhook') |
+             list | first | default({}) }}
+      no_log: true
+      tags: [credentials]
+    - name: Register the Argo CD push webhook in GitHub
+      ansible.builtin.uri:
+        url: "https://api.github.com/repos/{{ gitops_repository_slug }}/hooks"
+        method: POST
+        headers:
+          Accept: application/vnd.github+json
+          Authorization: "Bearer {{ vault_github_webhook_token }}"
+          X-GitHub-Api-Version: "2022-11-28"
+        body_format: json
+        body:
+          name: web
+          active: true
+          events: [push]
+          config:
+            url: "https://{{ argocd_domain }}/api/webhook"
+            content_type: json
+            insecure_ssl: "0"
+            secret: "{{ vault_argocd_webhook_secret }}"
+        status_code: 201
+      when: existing_argocd_webhook | length == 0
+      no_log: true
+      tags: [credentials]
+    - name: Synchronize the existing Argo CD push webhook secret
+      ansible.builtin.uri:
+        url: >-
+          https://api.github.com/repos/{{ gitops_repository_slug
+          }}/hooks/{{ existing_argocd_webhook.id }}
+        method: PATCH
+        headers:
+          Accept: application/vnd.github+json
+          Authorization: "Bearer {{ vault_github_webhook_token }}"
+          X-GitHub-Api-Version: "2022-11-28"
+        body_format: json
+        body:
+          active: true
+          events: [push]
+          config:
+            url: "https://{{ argocd_domain }}/api/webhook"
+            content_type: json
+            insecure_ssl: "0"
+            secret: "{{ vault_argocd_webhook_secret }}"
+        status_code: 200
+      when: existing_argocd_webhook | length > 0
+      no_log: true
+      tags: [credentials]
+

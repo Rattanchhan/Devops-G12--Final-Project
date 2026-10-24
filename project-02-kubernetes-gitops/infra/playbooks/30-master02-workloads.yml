@@ -1,0 +1,46 @@
+---
+- name: Make only master02 eligible for ordinary workloads
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    kubeconfig_path: "{{ lookup('env', 'KUBECONFIG') }}"
+  tasks:
+    - name: Require an explicit kubeconfig
+      ansible.builtin.assert:
+        that:
+          - kubeconfig_path | length > 0
+        fail_msg: Export KUBECONFIG with the authorized cluster config path.
+
+    - name: Read current master02 node definition
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: v1
+        kind: Node
+        name: master02
+      register: master02_info
+
+    - name: Validate expected master02 exists
+      ansible.builtin.assert:
+        that:
+          - master02_info.resources | length == 1
+        fail_msg: Node master02 was not found; inspect actual Kubespray node names.
+
+    - name: Remove standard control-plane NoSchedule taint from master02
+      kubernetes.core.k8s_taint:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: absent
+        name: master02
+        taints:
+          - effect: NoSchedule
+            key: node-role.kubernetes.io/control-plane
+
+    - name: Ensure master01 remains protected from ordinary workloads
+      kubernetes.core.k8s_taint:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        name: master01
+        taints:
+          - effect: NoSchedule
+            key: node-role.kubernetes.io/control-plane
+

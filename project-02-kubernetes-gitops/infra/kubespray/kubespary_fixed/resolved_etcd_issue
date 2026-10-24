@@ -1,0 +1,163 @@
+
+#==============Recovery pattern for a failed member is to remove that member from the healthy cluster==============
+Yes — and the earlier approach needs one correction.
+
+If etcd3 is already registered in the healthy cluster on master-1/master-2, but instance1 lost or replaced its /var/lib/etcd data, 
+etcd cannot simply start again as that same already-bootstrapped member. 
+The supported recovery pattern for a failed member is to remove that member from the healthy cluster and add it back, 
+then start it with fresh local data.
+
+Since master-1 and master-2 are healthy and have quorum, do this carefully.
+
+On master-1 or master-2, first list members:
+sudo ETCDCTL_API=3 etcdctl \
+  --endpoints=https://172.31.2.28:2379 \
+  --cacert=/etc/ssl/etcd/ssl/ca.pem \
+  --cert=/etc/ssl/etcd/ssl/admin-master-1.pem \
+  --key=/etc/ssl/etcd/ssl/admin-master-1-key.pem \
+  member list --write-out=table
+
+Find the member ID corresponding to:
+
+etcd3
+https://172.31.29.155:2380
+
+Suppose it is still:
+
+4b6b45413087195c
+
+Then remove only that member:
+
+sudo ETCDCTL_API=3 etcdctl \
+  --endpoints=https://172.31.10.90:2379 \
+  --cacert=/etc/ssl/etcd/ssl/ca.pem \
+  --cert=/etc/ssl/etcd/ssl/admin-master-1.pem \
+  --key=/etc/ssl/etcd/ssl/admin-master-1-key.pem \
+  member remove de0797b09105a8c5
+
+Then add it back:
+
+sudo ETCDCTL_API=3 etcdctl \
+  --endpoints=https://172.31.10.90:2379 \
+  --cacert=/etc/ssl/etcd/ssl/ca.pem \
+  --cert=/etc/ssl/etcd/ssl/admin-master-1.pem \
+  --key=/etc/ssl/etcd/ssl/admin-master-1-key.pem \
+  member add etcd3 \
+  --peer-urls=https://172.31.24.207:2380
+
+The member add output is important. It should print environment variables similar to:
+
+ETCD_NAME="etcd3"
+ETCD_INITIAL_CLUSTER="etcd1=https://172.31.6.64:2380,etcd2=https://172.31.12.230:2380,etcd3=https://172.31.29.155:2380"
+ETCD_INITIAL_ADVERTISE_PEER_URLS="https://172.31.29.155:2380"
+ETCD_INITIAL_CLUSTER_STATE="existing"
+
+That is exactly the two-step process etcd requires: register the member first, then start the new member against the existing cluster.
+
+On instance1, stop etcd and clean only its local etcd data:
+
+sudo systemctl stop etcd
+
+sudo mv /var/lib/etcd /var/lib/etcd.old-$(date +%Y%m%d-%H%M%S)
+
+sudo mkdir -p /var/lib/etcd
+sudo chown root:root /var/lib/etcd
+
+Verify /etc/etcd.env still contains:
+
+ETCD_NAME=etcd3
+ETCD_INITIAL_CLUSTER_STATE=existing
+
+ETCD_INITIAL_CLUSTER=etcd1=https://172.31.6.64:2380,etcd2=https://172.31.12.230:2380,etcd3=https://172.31.29.155:2380
+
+Then start it:
+
+sudo systemctl start etcd
+
+Watch immediately:
+
+sudo journalctl -fu etcd
+
+You should no longer get:
+
+member ... has already been bootstrapped
+
+or:
+
+request cluster ID mismatch
+
+Then verify from a healthy master:
+
+sudo ETCDCTL_API=3 etcdctl \
+  --endpoints=https://172.31.6.64:2379,https://172.31.12.230:2379,https://172.31.29.155:2379 \
+  --cacert=/etc/ssl/etcd/ssl/ca.pem \
+  --cert=/etc/ssl/etcd/ssl/admin-master-1.pem \
+  --key=/etc/ssl/etcd/ssl/admin-master-1-key.pem \
+  endpoint health
+
+You want:
+
+172.31.6.64:2379      is healthy
+172.31.12.230:2379    is healthy
+172.31.29.155:2379    is healthy
+
+
+#==============Recovery pattern for a failed member is to remove that member from the healthy cluster==============
+Yes — this output is exactly what we expect immediately after re-adding etcd3.
+
+The key row is:
+
+| b73a59790f862e12 | unstarted |       | https://172.31.29.155:2380 | | false |
+
+That means the healthy cluster has registered a new member ID for instance1:
+
+b73a59790f862e12
+
+and it is waiting for that member to start.
+
+This is good, because the old removed member ID was:
+
+4b6b45413087195c
+
+So now on instance1, make sure the old local data is completely gone:
+
+sudo systemctl stop etcd
+
+sudo mv /var/lib/etcd /var/lib/etcd.old-$(date +%Y%m%d-%H%M%S)
+sudo mkdir -p /var/lib/etcd
+sudo chmod 700 /var/lib/etcd
+sudo chown root:root /var/lib/etcd
+
+Then verify:
+
+sudo ls -la /var/lib/etcd
+
+It should be empty.
+
+Also verify /etc/etcd.env uses:
+
+ETCD_INITIAL_CLUSTER_STATE=existing
+
+and:
+
+ETCD_INITIAL_CLUSTER=etcd1=https://172.31.6.64:2380,etcd2=https://172.31.12.230:2380,etcd3=https://172.31.29.155:2380
+
+Then start etcd:
+
+sudo systemctl start etcd
+
+Watch:
+
+sudo journalctl -fu etcd
+
+If successful, rerun the member list from master-1. The row should change from:
+
+b73a59790f862e12 | unstarted | ...
+
+to something like:
+
+b73a59790f862e12 | started | etcd3 | https://172.31.29.155:2380 | https://172.31.29.155:2379
+
+That is the state you want before rerunning Kubespray.
+
+So yes: the add operation succeeded. etcd3 is registered correctly now; it just has not started yet.

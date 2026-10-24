@@ -1,0 +1,307 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+environment := env_var_or_default("TARGET_ENVIRONMENT", "dev")
+venv := ".venv"
+ansible_playbook := venv + "/bin/ansible-playbook"
+ansible_galaxy := venv + "/bin/ansible-galaxy"
+ansible_inventory := venv + "/bin/ansible-inventory"
+ansible_lint := venv + "/bin/ansible-lint"
+ansible_vault := venv + "/bin/ansible-vault"
+vault_file := "inventories/dev/group_vars/all/vault.yml"
+
+# Show available project actions.
+default:
+    @just --list
+
+# Check local commands without changing the machine.
+doctor:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    failed=0
+    for command in python3 ssh-keygen; do
+      if command -v "$command" >/dev/null; then
+        printf '%-20s %s\n' "$command" "OK"
+      else
+        printf '%-20s %s\n' "$command" "MISSING"
+        failed=1
+      fi
+    done
+    if python3 -m venv --help >/dev/null 2>&1; then
+      printf '%-20s %s\n' "python3-venv" "OK"
+    else
+      printf '%-20s %s\n' "python3-venv" "MISSING (install python3-venv)"
+      failed=1
+    fi
+    exit "$failed"
+
+# Create the local Python environment and install pinned Ansible dependencies.
+setup:
+    python3 -m venv {{ venv }}
+    {{ venv }}/bin/pip install --upgrade pip
+    {{ venv }}/bin/pip install ansible-core==2.18.6 ansible-lint==25.6.1 boto3 botocore
+    {{ ansible_galaxy }} collection install -r requirements.yml
+
+# Create the local EC2 SSH key pair if it does not exist.
+key-init:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    test -x "{{ venv }}/bin/python" || { echo "Run 'just setup' first." >&2; exit 1; }
+    readarray -t key_config < <("{{ venv }}/bin/python" - <<'PY'
+    from pathlib import Path
+    import yaml
+    config = yaml.safe_load(Path("inventories/dev/group_vars/all/main.yml").read_text())
+    print(Path(config["aws_ssh_private_key_file"]).expanduser())
+    print(config["aws_key_name"])
+    PY
+    )
+    key_path="${key_config[0]}"
+    key_name="${key_config[1]}"
+    test -n "$key_path" && [[ "$key_path" != "/" ]] || { echo "Unsafe SSH key path." >&2; exit 1; }
+    mkdir -p "$(dirname "$key_path")"
+    if [[ -f "$key_path" && -f "$key_path.pub" ]]; then
+      chmod 600 "$key_path"
+      chmod 644 "$key_path.pub"
+      echo "Existing SSH key pair retained: $key_path"
+      exit 0
+    fi
+    if [[ -f "$key_path.pub" && ! -f "$key_path" ]]; then
+      echo "Public key exists but private key is missing: $key_path" >&2
+      exit 1
+    fi
+    if [[ -f "$key_path" ]]; then
+      ssh-keygen -y -f "$key_path" > "$key_path.pub"
+      chmod 600 "$key_path"
+      chmod 644 "$key_path.pub"
+      echo "Recreated missing public key: $key_path.pub"
+      exit 0
+    fi
+    umask 077
+    ssh-keygen -q -t ed25519 -N "" -C "$key_name" -f "$key_path"
+    chmod 644 "$key_path.pub"
+    echo "Created SSH key pair: $key_path"
+
+# Show whether vault.yml is encrypted without displaying its contents.
+vault-status:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    vault_file="{{ vault_file }}"
+    if [[ ! -f "$vault_file" ]]; then
+      echo "MISSING: $vault_file"
+      exit 1
+    fi
+    if head -n 1 "$vault_file" | grep -q '^\$ANSIBLE_VAULT;'; then
+      echo "ENCRYPTED: $vault_file"
+    else
+      echo "PLAINTEXT: $vault_file"
+      exit 1
+    fi
+
+# Encrypt vault.yml; Ansible securely prompts for a new Vault password twice.
+vault-encrypt:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    test -x "{{ ansible_vault }}" || { echo "Run 'just setup' first." >&2; exit 1; }
+    test -f "{{ vault_file }}" || { echo "Missing {{ vault_file }}" >&2; exit 1; }
+    if head -n 1 "{{ vault_file }}" | grep -q '^\$ANSIBLE_VAULT;'; then
+      echo "Already encrypted: {{ vault_file }}"
+      exit 0
+    fi
+    {{ ansible_vault }} encrypt "{{ vault_file }}"
+
+# Decrypt vault.yml to plaintext after an interactive password prompt.
+vault-decrypt:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    test -x "{{ ansible_vault }}" || { echo "Run 'just setup' first." >&2; exit 1; }
+    test -f "{{ vault_file }}" || { echo "Missing {{ vault_file }}" >&2; exit 1; }
+    if ! head -n 1 "{{ vault_file }}" | grep -q '^\$ANSIBLE_VAULT;'; then
+      echo "Already plaintext: {{ vault_file }}"
+      exit 0
+    fi
+    {{ ansible_vault }} decrypt "{{ vault_file }}"
+
+# Display decrypted Vault content without writing plaintext to disk.
+vault-view:
+    test -x {{ ansible_vault }} || { echo "Run 'just setup' first." >&2; exit 1; }
+    {{ ansible_vault }} view {{ vault_file }}
+
+# Edit Vault content while keeping the file encrypted at rest.
+vault-edit:
+    test -x {{ ansible_vault }} || { echo "Run 'just setup' first." >&2; exit 1; }
+    {{ ansible_vault }} edit {{ vault_file }}
+
+# Validate required files, placeholders, Vault encryption, and the SSH key.
+validate-config:
+    #!/usr/bin/env python3
+    from pathlib import Path
+    import subprocess
+    import sys
+    import yaml
+
+    root = Path.cwd()
+    all_path = root / "inventories/dev/group_vars/all/main.yml"
+    vault_path = root / "inventories/dev/group_vars/all/vault.yml"
+    errors = []
+
+    for path in (all_path, vault_path):
+        if not path.is_file():
+            errors.append(f"missing required file: {path.relative_to(root)}")
+
+    if all_path.is_file():
+        text = all_path.read_text()
+        if "CHANGE_ME" in text:
+            errors.append("all.yml still contains CHANGE_ME values")
+        config = yaml.safe_load(text) or {}
+        key_path = Path(str(config.get("aws_ssh_private_key_file", ""))).expanduser()
+        if not key_path.is_file():
+            errors.append(f"EC2 private key not found: {key_path}")
+        elif not Path(f"{key_path}.pub").is_file():
+            errors.append(f"EC2 public key not found: {key_path}.pub")
+        else:
+            derived = subprocess.run(
+                ["ssh-keygen", "-y", "-f", str(key_path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.split()
+            public = Path(f"{key_path}.pub").read_text().split()
+            if derived[:2] != public[:2]:
+                errors.append("EC2 public and private SSH keys do not match")
+        instances = config.get("project_instances", [])
+        if len(instances) != 4:
+            errors.append(f"expected 4 project instances, found {len(instances)}")
+        names = [item.get("eip_name") for item in instances]
+        if None in names or len(set(names)) != 4:
+            errors.append("each instance must have a unique eip_name")
+
+    if vault_path.is_file():
+        vault_text = vault_path.read_text()
+        if not vault_text.startswith("$ANSIBLE_VAULT;"):
+            errors.append("vault.yml is not encrypted with Ansible Vault")
+
+    if errors:
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        raise SystemExit(1)
+    print("Project configuration is valid.")
+
+# Verify AWS identity, VPC, subnet, EC2 key pair, and all four EIPs (read-only).
+validate-aws:
+    #!/usr/bin/env python3
+    from pathlib import Path
+    import boto3
+    import yaml
+    from botocore.exceptions import ClientError
+
+    config = yaml.safe_load(Path("inventories/dev/group_vars/all/main.yml").read_text())
+    region = config["aws_region"]
+    try:
+        identity = boto3.client("sts", region_name=region).get_caller_identity()
+        ec2 = boto3.client("ec2", region_name=region)
+
+        vpc = ec2.describe_vpcs(VpcIds=[config["aws_vpc_id"]])["Vpcs"][0]
+        subnet = ec2.describe_subnets(
+            SubnetIds=[config["aws_subnet_id"]]
+        )["Subnets"][0]
+        if subnet["VpcId"] != vpc["VpcId"]:
+            raise SystemExit(
+                "Configured subnet does not belong to the configured VPC."
+            )
+        key_pairs = ec2.describe_key_pairs(
+            Filters=[{"Name": "key-name", "Values": [config["aws_key_name"]]}]
+        )["KeyPairs"]
+
+        print(f"AWS account: {identity['Account']}")
+        print(f"AWS identity: {identity['Arn']}")
+        print(f"Region: {region}")
+        print(f"VPC: {vpc['VpcId']}")
+        print(f"Subnet: {subnet['SubnetId']}")
+        key_state = "present" if key_pairs else "missing; provisioning will import it"
+        print(f"EC2 key pair: {config['aws_key_name']} ({key_state})")
+
+        for host in config["project_instances"]:
+            eip_name = host["eip_name"]
+            addresses = ec2.describe_addresses(
+                Filters=[{"Name": "tag:Name", "Values": [eip_name]}]
+            )["Addresses"]
+            if len(addresses) != 1:
+                raise SystemExit(
+                    f"Expected one EIP named {eip_name}; found {len(addresses)}."
+                )
+            address = addresses[0]
+            attached = address.get("InstanceId", "available")
+            print(f"{host['name']}: {address['PublicIp']} ({attached})")
+    except ClientError as error:
+        detail = error.response["Error"]
+        raise SystemExit(
+            f"AWS validation failed [{detail['Code']}]: {detail['Message']}"
+        ) from None
+
+# Run Ansible syntax and lint checks.
+syntax:
+    test -x {{ ansible_playbook }} || { echo "Run 'just setup' first." >&2; exit 1; }
+    {{ ansible_playbook }} playbooks/site.yml --syntax-check --ask-vault-pass
+    ANSIBLE_INVENTORY=/dev/null {{ ansible_lint }}
+
+# Run all non-mutating project validation.
+validate: validate-config validate-aws syntax
+
+# Create/reconcile instances, associate EIPs, and generate inventory.
+provision: validate-config validate-aws
+    test -x {{ ansible_playbook }} || { echo "Run 'just setup' first." >&2; exit 1; }
+    {{ ansible_playbook }} playbooks/00-provision.yml -e target_environment={{ environment }}
+
+# Show the generated Ansible inventory.
+inventory:
+    test -x {{ ansible_inventory }} || { echo "Run 'just setup' first." >&2; exit 1; }
+    {{ ansible_inventory }} --graph
+
+# Test SSH connectivity to all generated inventory hosts.
+ping:
+    test -x {{ venv }}/bin/ansible || { echo "Run 'just setup' first." >&2; exit 1; }
+    {{ venv }}/bin/ansible all -m ansible.builtin.ping
+
+# Configure base packages, users, Docker, and host security.
+bootstrap:
+    {{ ansible_playbook }} playbooks/10-bootstrap.yml --ask-vault-pass
+
+# Deploy Jenkins, SonarQube, Nexus, and the Jenkins agent.
+services:
+    {{ ansible_playbook }} playbooks/20-services.yml --ask-vault-pass
+
+# Configure NGINX and HTTPS certificates.
+edge:
+    {{ ansible_playbook }} playbooks/30-edge-https.yml --ask-vault-pass
+
+# Verify required operator tools and the private Portainer deployment.
+verify-tools:
+    test -x {{ ansible_playbook }} || { echo "Run 'just setup' first." >&2; exit 1; }
+    {{ ansible_playbook }} playbooks/41-verify-tooling.yml --ask-vault-pass
+
+# Run all application, infrastructure, and tooling verification.
+verify:
+    {{ ansible_playbook }} playbooks/40-verify.yml --ask-vault-pass
+
+# Provision and configure the complete environment in dependency order.
+deploy: validate-config validate-aws
+    test -x {{ ansible_playbook }} || { echo "Run 'just setup' first." >&2; exit 1; }
+    {{ ansible_playbook }} playbooks/site.yml --ask-vault-pass -e target_environment={{ environment }}
+
+# Recreate service containers while preserving named volumes.
+reset-services confirmation="":
+    test "{{ confirmation }}" = "reset-{{ environment }}" || { echo "Run: just reset-services reset-{{ environment }}" >&2; exit 1; }
+    {{ ansible_playbook }} playbooks/50-reset-services.yml --ask-vault-pass -e target_environment={{ environment }} -e confirm_service_reset=true
+
+# Print the instances selected for destruction; this intentionally fails after listing them.
+destroy-plan:
+    {{ ansible_playbook }} playbooks/99-destroy.yml -e target_environment={{ environment }} -e confirm_destroy=false
+
+# Terminate tagged instances; retained EIPs can be reused by the next provision run.
+destroy confirmation="":
+    test "{{ confirmation }}" = "destroy-{{ environment }}" || { echo "Run: just destroy destroy-{{ environment }}" >&2; exit 1; }
+    {{ ansible_playbook }} playbooks/99-destroy.yml -e target_environment={{ environment }} -e confirm_destroy=true
+
+# Attach isolated Kubernetes networking to the four existing Project 1 VMs.
+transition-project2 confirmation="":
+    test "{{ confirmation }}" = "transition-project2" || { echo "Run: just transition-project2 transition-project2" >&2; exit 1; }
+    {{ ansible_playbook }} playbooks/60-transition-project2.yml -e confirm_project2_transition=true

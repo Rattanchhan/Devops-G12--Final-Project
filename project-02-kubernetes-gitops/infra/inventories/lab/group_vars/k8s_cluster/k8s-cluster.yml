@@ -1,0 +1,4 @@
+---
+# Deprecated compatibility pointer. Cluster variables are maintained only in:
+# infra/kubespray/inventory/project02/group_vars/
+

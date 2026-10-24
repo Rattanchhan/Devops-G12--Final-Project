@@ -1,0 +1,63 @@
+---
+- name: Verify cluster acceptance conditions
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    kubeconfig_path: "{{ lookup('env', 'KUBECONFIG') }}"
+  tasks:
+    - name: Read nodes
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: v1
+        kind: Node
+      register: nodes
+    - name: Assert exact four-node topology and readiness
+      ansible.builtin.assert:
+        that:
+          - nodes.resources | length == 4
+          - nodes.resources | map(attribute='metadata.name') | sort | list == ['master01', 'master02', 'worker01', 'worker02']
+    - name: Assert each node is Ready
+      ansible.builtin.assert:
+        that:
+          - >-
+            item.status.conditions | selectattr('type', 'equalto', 'Ready') |
+            selectattr('status', 'equalto', 'True') | list | length == 1
+      loop: "{{ nodes.resources }}"
+      loop_control: {label: "{{ item.metadata.name }}"}
+    - name: Assert the three-member etcd inventory
+      ansible.builtin.assert:
+        that:
+          - groups['etcd'] | length == 3
+          - groups['etcd'] | sort == ['master01', 'master02', 'worker01']
+        fail_msg: Actual etcd membership differs from the documented three-member baseline.
+    - name: Read all pods
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: v1
+        kind: Pod
+      register: pods
+    - name: Report non-running pods
+      ansible.builtin.debug:
+        msg: "{{ pods.resources | rejectattr('status.phase', 'equalto', 'Running') | map(attribute='metadata.name') | list }}"
+    - name: Read ingress classes
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: networking.k8s.io/v1
+        kind: IngressClass
+      register: ingress_classes
+    - name: Assert Traefik is present and NGINX absent
+      ansible.builtin.assert:
+        that:
+          - "'traefik' in (ingress_classes.resources | map(attribute='metadata.name') | list)"
+          - "'nginx' not in (ingress_classes.resources | map(attribute='metadata.name') | list)"
+
+- name: Verify each host-based etcd member
+  hosts: etcd
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Confirm etcd service is active
+      ansible.builtin.command: systemctl is-active etcd
+      changed_when: false
+

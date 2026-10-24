@@ -1,0 +1,6 @@
+---
+- name: Configure HTTPS endpoints
+  hosts: jenkins:sonarqube:nexus
+  become: true
+  roles:
+    - role: reverse_proxy

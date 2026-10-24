@@ -1,0 +1,5 @@
+---
+service_domain: "{{ jenkins_domain }}"
+service_upstream_port: 8080
+service_compose_project: jenkins
+service_containers: [jenkins]

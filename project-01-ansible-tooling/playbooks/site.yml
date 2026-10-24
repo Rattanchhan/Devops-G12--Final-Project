@@ -1,0 +1,11 @@
+---
+- name: Provision infrastructure
+  import_playbook: 00-provision.yml
+- name: Bootstrap hosts
+  import_playbook: 10-bootstrap.yml
+- name: Deploy services
+  import_playbook: 20-services.yml
+- name: Configure HTTPS endpoints
+  import_playbook: 30-edge-https.yml
+- name: Verify deployment
+  import_playbook: 40-verify.yml

@@ -1,0 +1,27 @@
+---
+- name: Validate Kubespray checkout and inventory
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    kubespray_dir: "{{ playbook_dir }}/../kubespray"
+    kubespray_inventory_path: "{{ kubespray_dir }}/inventory/project02/hosts.yml"
+  tasks:
+    - name: Check required files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: ["{{ kubespray_dir }}/cluster.yml", "{{ kubespray_inventory_path }}"]
+      register: required_files
+    - name: Require installed pinned Kubespray and configured inventory
+      ansible.builtin.assert:
+        that: required_files.results | map(attribute='stat.exists') | min
+    - name: Run vendored Kubespray cluster playbook
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python | dirname }}/ansible-playbook"
+          - -i
+          - "{{ kubespray_inventory_path }}"
+          - -b
+          - "{{ kubespray_dir }}/cluster.yml"
+        chdir: "{{ kubespray_dir }}"
+      changed_when: true

@@ -1,0 +1,90 @@
+---
+- name: Attach isolated Project 02 cluster networking to Project 01 instances
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../inventories/dev/group_vars/all/main.yml
+  vars:
+    confirm_project2_transition: false
+    project2_security_group_name: devops-g12-p2-reuse
+    expected_project1_hosts:
+      - agent01
+      - artifacts01
+      - ci01
+      - quality01
+  tasks:
+    - name: Require explicit Project 02 transition confirmation
+      ansible.builtin.assert:
+        that:
+          - confirm_project2_transition | bool
+          - target_environment == 'dev'
+          - project_tag == 'devops-g12-p1'
+        fail_msg: >-
+          Run with -e confirm_project2_transition=true only after Project 1
+          evidence and data have been backed up.
+
+    - name: Discover the four Project 01 instances
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Project": "{{ project_tag }}"
+          "tag:Environment": "{{ target_environment }}"
+          "tag:ManagedBy": Ansible
+          instance-state-name: [running]
+      register: transition_instances
+
+    - name: Validate the exact transition scope
+      ansible.builtin.assert:
+        that:
+          - transition_instances.instances | length == 4
+          - transition_instances.instances | map(attribute='tags.Name') | sort | list == expected_project1_hosts
+          - transition_instances.instances | map(attribute='vpc_id') | unique | list == [aws_vpc_id]
+        fail_msg: Refusing transition because the exact four Project 01 instances were not found.
+
+    - name: Create the isolated Project 02 security group
+      amazon.aws.ec2_security_group:
+        name: "{{ project2_security_group_name }}"
+        description: Internal Kubernetes traffic for reused Project 01 instances
+        region: "{{ aws_region }}"
+        vpc_id: "{{ aws_vpc_id }}"
+        purge_rules: false
+        purge_rules_egress: false
+        tags:
+          Project: devops-g12-p2
+          Environment: lab
+          ManagedBy: Ansible
+          SourceProject: "{{ project_tag }}"
+      register: project2_security_group
+
+    - name: Allow traffic only between members of the Project 02 group
+      amazon.aws.ec2_security_group:
+        name: "{{ project2_security_group_name }}"
+        description: Internal Kubernetes traffic for reused Project 01 instances
+        region: "{{ aws_region }}"
+        vpc_id: "{{ aws_vpc_id }}"
+        purge_rules: false
+        purge_rules_egress: false
+        rules:
+          - proto: -1
+            group_id: "{{ project2_security_group.group_id }}"
+            rule_desc: Kubernetes node-to-node traffic
+
+    - name: Attach Project 02 group to each primary network interface
+      amazon.aws.ec2_eni:
+        eni_id: "{{ item.network_interfaces[0].network_interface_id }}"
+        region: "{{ aws_region }}"
+        security_groups: >-
+          {{ (item.security_groups | map(attribute='group_id') | list +
+              [project2_security_group.group_id]) | unique | list }}
+        purge_tags: false
+        state: present
+      loop: "{{ transition_instances.instances }}"
+      loop_control:
+        label: "{{ item.tags.Name }}"
+
+    - name: Report transitioned instances and isolated group
+      ansible.builtin.debug:
+        msg:
+          security_group: "{{ project2_security_group.group_id }}"
+          instances: "{{ transition_instances.instances | map(attribute='instance_id') | list }}"

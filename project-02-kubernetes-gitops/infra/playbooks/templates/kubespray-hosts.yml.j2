@@ -1,0 +1,30 @@
+---
+all:
+  vars:
+    ansible_user: "{{ ansible_user }}"
+    ansible_ssh_private_key_file: "{{ aws_ssh_private_key_file }}"
+  hosts:
+{% for node in cluster_nodes %}
+    {{ node.name }}:
+      ansible_host: {{ project_eip_addresses[node.name].public_ip }}
+      ip: {{ project_instance_details[node.name].private_ip_address }}
+      access_ip: {{ project_instance_details[node.name].private_ip_address }}
+{% endfor %}
+  children:
+    kube_control_plane:
+      hosts:
+        master01:
+        master02:
+    kube_node:
+      hosts:
+{% for node in cluster_nodes %}
+        {{ node.name }}:
+{% endfor %}
+    etcd:
+      hosts:
+        master01:
+        master02:
+    k8s_cluster:
+      children:
+        kube_control_plane:
+        kube_node:

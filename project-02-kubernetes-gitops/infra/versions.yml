@@ -1,0 +1,13 @@
+---
+# Review this pinned compatibility set before upgrades; never float versions.
+kubespray_source_revision: "212ac5eeed8c10715faabc9ebbed4e16c727888e"
+kubernetes_version: "1.32.11"
+container_runtime: containerd
+cni: calico
+traefik_chart_version: "34.2.0"
+cert_manager_chart_version: "v1.17.1"
+headlamp_chart_version: "0.31.1"
+argocd_chart_version: "7.8.13"
+helm_version: "v3.17.1"
+node_version: "22"
+

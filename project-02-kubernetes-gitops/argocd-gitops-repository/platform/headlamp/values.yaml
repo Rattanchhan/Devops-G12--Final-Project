@@ -1,0 +1,17 @@
+replicaCount: 2
+config:
+  inCluster: true
+serviceAccount:
+  create: true
+  clusterRoleBinding:
+    create: false
+ingress:
+  enabled: true
+  ingressClassName: traefik
+  annotations: {cert-manager.io/cluster-issuer: letsencrypt-prod}
+  hosts: [{host: headlamp.trsd.tech, paths: [{path: /, type: Prefix}]}]
+  tls: [{secretName: headlamp-tls, hosts: [headlamp.trsd.tech]}]
+resources:
+  requests: {cpu: 50m, memory: 128Mi}
+  limits: {cpu: 300m, memory: 256Mi}
+

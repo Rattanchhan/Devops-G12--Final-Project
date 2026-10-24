@@ -1,0 +1,42 @@
+---
+- name: Install GitHub CLI signing key
+  ansible.builtin.get_url:
+    url: https://cli.github.com/packages/githubcli-archive-keyring.gpg
+    dest: /usr/share/keyrings/githubcli-archive-keyring.gpg
+    mode: "0644"
+
+- name: Configure GitHub CLI repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [arch={{ 'amd64' if ansible_architecture == 'x86_64' else ansible_architecture }}
+      signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg]
+      https://cli.github.com/packages stable main
+    filename: github-cli
+    state: present
+
+- name: Install GitHub CLI
+  ansible.builtin.apt:
+    name: gh
+    state: present
+    update_cache: true
+
+- name: Install Oh My Zsh unattended for administrative user
+  ansible.builtin.git:
+    repo: https://github.com/ohmyzsh/ohmyzsh.git
+    dest: "/home/{{ admin_user }}/.oh-my-zsh"
+    version: master
+    depth: 1
+  become: true
+  become_user: "{{ admin_user }}"
+
+- name: Configure Zsh
+  ansible.builtin.copy:
+    dest: "/home/{{ admin_user }}/.zshrc"
+    owner: "{{ admin_user }}"
+    group: "{{ admin_user }}"
+    mode: "0644"
+    content: |
+      export ZSH="$HOME/.oh-my-zsh"
+      ZSH_THEME="robbyrussell"
+      plugins=(git docker)
+      source "$ZSH/oh-my-zsh.sh"

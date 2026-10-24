@@ -1,0 +1,5 @@
+profile: production
+exclude_paths:
+  - .ansible/
+  - .venv/
+  - inventories/dev/group_vars/all/vault.yml

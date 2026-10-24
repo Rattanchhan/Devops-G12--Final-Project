@@ -1,0 +1,13 @@
+.ansible/
+.venv/
+*.retry
+*.pem
+*.key
+.env
+vault-password*
+**/vault.yml
+inventories/dev/hosts.yml
+inventories/dev/known_hosts
+inventories/dev/group_vars/all.yml
+artifacts/
+

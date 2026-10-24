@@ -1,0 +1,16 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: react-demo
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: react-prod-redirect-https@kubernetescrd
+spec:
+  tls: [{hosts: [reactjs.trsd.tech], secretName: react-demo-prod-tls}]
+  rules:
+    - host: reactjs.trsd.tech
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: {service: {name: react-demo, port: {name: http}}}
+

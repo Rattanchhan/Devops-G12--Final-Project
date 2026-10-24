@@ -1,0 +1,7 @@
+---
+- name: Reconcile Jenkins
+  community.docker.docker_compose_v2:
+    project_src: /opt/jenkins
+    state: present
+    build: always
+    pull: never

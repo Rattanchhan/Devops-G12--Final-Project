@@ -1,0 +1,35 @@
+---
+- name: Validate Jenkins agent public key
+  ansible.builtin.assert:
+    that: jenkins_agent_public_key != 'CHANGE_ME'
+    fail_msg: Configure the public key matching vault_jenkins_agent_private_key.
+- name: Install agent build dependencies
+  ansible.builtin.apt:
+    name: [git, openjdk-21-jre-headless]
+    state: present
+- name: Create dedicated Jenkins agent account
+  ansible.builtin.user:
+    name: jenkins-agent
+    home: /var/lib/jenkins-agent
+    shell: /bin/bash
+    create_home: true
+- name: Authorize controller credential for agent
+  ansible.posix.authorized_key:
+    user: jenkins-agent
+    key: "{{ jenkins_agent_public_key }}"
+    state: present
+- name: Configure agent workspace
+  ansible.builtin.file:
+    path: /var/lib/jenkins-agent/workspace
+    state: directory
+    owner: jenkins-agent
+    group: jenkins-agent
+    mode: "0750"
+- name: Configure weekly workspace cleanup
+  ansible.builtin.cron:
+    name: Clean old Jenkins workspaces
+    user: jenkins-agent
+    weekday: "0"
+    hour: "3"
+    minute: "0"
+    job: find /var/lib/jenkins-agent/workspace -mindepth 1 -mtime +14 -delete

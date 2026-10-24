@@ -1,0 +1,27 @@
+---
+- name: Guard full Kubespray reset
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    confirm_reset: false
+    target_environment: unset
+  tasks:
+    - name: Require explicit lab reset confirmation
+      ansible.builtin.assert:
+        that:
+          - confirm_reset | bool
+          - target_environment == 'lab'
+        fail_msg: Reset requires -e confirm_reset=true -e target_environment=lab.
+    - name: Run pinned Kubespray reset procedure
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python | dirname }}/ansible-playbook"
+          - -i
+          - "{{ playbook_dir }}/../kubespray/inventory/project02/hosts.yml"
+          - -b
+          - "{{ playbook_dir }}/../kubespray/reset.yml"
+          - -e
+          - reset_confirmation=yes
+        chdir: "{{ playbook_dir }}/../kubespray"
+      changed_when: true

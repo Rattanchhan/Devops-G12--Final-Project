@@ -1,0 +1,33 @@
+---
+- name: Allow private cluster traffic between reused Project 01 instances
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../../../project-01-ansible-tooling/inventories/dev/group_vars/all/main.yml
+  tasks:
+    - name: Find the existing Project 01 security group
+      amazon.aws.ec2_security_group_info:
+        region: "{{ aws_region }}"
+        filters:
+          group-name: "{{ project_tag }}-{{ target_environment }}"
+          vpc-id: "{{ aws_vpc_id }}"
+      register: reused_security_groups
+
+    - name: Require exactly one reusable security group
+      ansible.builtin.assert:
+        that: reused_security_groups.security_groups | length == 1
+        fail_msg: Expected exactly one Project 01 security group.
+
+    - name: Allow all traffic within the reused node security group
+      amazon.aws.ec2_security_group:
+        name: "{{ project_tag }}-{{ target_environment }}"
+        description: Project 01 restricted ingress reused by Project 02 Kubernetes
+        region: "{{ aws_region }}"
+        vpc_id: "{{ aws_vpc_id }}"
+        purge_rules: false
+        purge_rules_egress: false
+        rules:
+          - proto: -1
+            group_id: "{{ reused_security_groups.security_groups[0].group_id }}"
+            rule_desc: Project 02 internal Kubernetes node traffic

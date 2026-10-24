@@ -1,0 +1,225 @@
+---
+- name: Provision Project 01 EC2 instances
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../inventories/dev/group_vars/all/main.yml
+  tasks:
+    - name: Validate provisioning inputs
+      ansible.builtin.assert:
+        that:
+          - target_environment in ['dev', 'test', 'prod']
+          - aws_vpc_id != 'CHANGE_ME'
+          - aws_subnet_id != 'CHANGE_ME'
+          - aws_key_name != 'CHANGE_ME'
+          - "'/' not in aws_key_name"
+          - aws_ssh_private_key_file != 'CHANGE_ME'
+          - ssh_allowed_cidr != 'CHANGE_ME/32'
+          - project_instances | length == 4
+          - project_instances | map(attribute='name') | unique | length == 4
+          - project_instances | map(attribute='eip_name') | unique | length == 4
+        fail_msg: Copy all.yml.example to all.yml and replace every CHANGE_ME value.
+
+    - name: Import the controller public key as the EC2 key pair
+      amazon.aws.ec2_key:
+        name: "{{ aws_key_name }}"
+        region: "{{ aws_region }}"
+        key_material: >-
+          {{ lookup('ansible.builtin.file', aws_ssh_private_key_file + '.pub') }}
+        force: true
+        tags:
+          Project: "{{ project_tag }}"
+          Environment: "{{ target_environment }}"
+          ManagedBy: Ansible
+        state: present
+
+    - name: Resolve the newest matching Ubuntu image when no AMI is pinned
+      amazon.aws.ec2_ami_info:
+        region: "{{ aws_region }}"
+        owners:
+          - "{{ aws_ami_owner }}"
+        filters:
+          name: "{{ aws_ami_name_pattern }}"
+          architecture: x86_64
+          root-device-type: ebs
+          state: available
+      register: discovered_amis
+      when: aws_ami_id | length == 0
+
+    - name: Select machine image
+      ansible.builtin.set_fact:
+        selected_ami_id: >-
+          {{ aws_ami_id if aws_ami_id | length > 0 else
+             (discovered_amis.images | sort(attribute='creation_date') | last).image_id }}
+
+    - name: Create project security group
+      amazon.aws.ec2_security_group:
+        name: "{{ project_tag }}-{{ target_environment }}"
+        description: Project 01 restricted ingress
+        region: "{{ aws_region }}"
+        vpc_id: "{{ aws_vpc_id }}"
+        tags:
+          Project: "{{ project_tag }}"
+          Environment: "{{ target_environment }}"
+          ManagedBy: Ansible
+        rules:
+          - proto: tcp
+            ports: [22]
+            cidr_ip: "{{ ssh_allowed_cidr }}"
+            rule_desc: SSH from the Ansible controller
+          - proto: tcp
+            ports: [80, 443]
+            cidr_ip: 0.0.0.0/0
+            rule_desc: HTTP and HTTPS ingress
+        rules_egress:
+          - proto: -1
+            cidr_ip: 0.0.0.0/0
+      register: project_security_group
+
+    - name: Create or reconcile exactly four project instances
+      amazon.aws.ec2_instance:
+        name: "{{ item.name }}"
+        region: "{{ aws_region }}"
+        image_id: "{{ selected_ami_id }}"
+        instance_type: "{{ item.instance_type }}"
+        key_name: "{{ aws_key_name }}"
+        network_interfaces:
+          - assign_public_ip: false
+            delete_on_termination: true
+            device_index: 0
+            groups:
+              - "{{ project_security_group.group_id }}"
+            subnet_id: "{{ aws_subnet_id }}"
+        exact_count: 1
+        filters:
+          "tag:Project": "{{ project_tag }}"
+          "tag:Environment": "{{ target_environment }}"
+          "tag:Name": "{{ item.name }}"
+          instance-state-name:
+            - pending
+            - running
+            - stopping
+            - stopped
+        volumes:
+          - device_name: /dev/sda1
+            ebs:
+              volume_size: "{{ item.root_volume_gb }}"
+              volume_type: gp3
+              delete_on_termination: true
+        tags:
+          Name: "{{ item.name }}"
+          Project: "{{ project_tag }}"
+          Environment: "{{ target_environment }}"
+          Service: "{{ item.group }}"
+          ManagedBy: Ansible
+        state: started
+        wait: true
+      loop: "{{ project_instances }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: provisioned_instances
+
+    - name: Index provisioned instances by host name
+      ansible.builtin.set_fact:
+        project_instance_details: >-
+          {{ project_instance_details | default({}) |
+             combine({item.item.name: item.instances[0]}) }}
+      loop: "{{ provisioned_instances.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Discover each preallocated Elastic IP by Name tag
+      amazon.aws.ec2_eip_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ item.eip_name }}"
+      loop: "{{ project_instances }}"
+      loop_control:
+        label: "{{ item.eip_name }}"
+      register: discovered_eips
+
+    - name: Require exactly one Elastic IP for each instance
+      ansible.builtin.assert:
+        that:
+          - item.addresses | length == 1
+        fail_msg: >-
+          Expected exactly one Elastic IP named {{ item.item.eip_name }} in
+          {{ aws_region }}, but found {{ item.addresses | length }}.
+      loop: "{{ discovered_eips.results }}"
+      loop_control:
+        label: "{{ item.item.eip_name }}"
+
+    - name: Index Elastic IPs by host name
+      ansible.builtin.set_fact:
+        project_eip_addresses: >-
+          {{ project_eip_addresses | default({}) |
+             combine({item.item.name: item.addresses[0]}) }}
+      loop: "{{ discovered_eips.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Associate each Elastic IP with its instance
+      amazon.aws.ec2_eip:
+        region: "{{ aws_region }}"
+        device_id: "{{ project_instance_details[item.name].instance_id }}"
+        public_ip: "{{ project_eip_addresses[item.name].public_ip }}"
+        allow_reassociation: true
+        state: present
+      loop: "{{ project_instances }}"
+      loop_control:
+        label: >-
+          {{ item.name }} -> {{ project_eip_addresses[item.name].public_ip }}
+
+    - name: Wait for SSH on each instance
+      ansible.builtin.wait_for:
+        host: "{{ project_eip_addresses[item.name].public_ip }}"
+        port: 22
+        timeout: 300
+        delay: 5
+      loop: "{{ project_instances }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Read SSH host keys from the provisioned instances
+      ansible.builtin.command:
+        argv:
+          - ssh-keyscan
+          - -T
+          - "10"
+          - -t
+          - ed25519,ecdsa,rsa
+          - "{{ project_eip_addresses[item.name].public_ip }}"
+      loop: "{{ project_instances }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: scanned_ssh_host_keys
+      changed_when: false
+
+    - name: Require SSH host keys for every instance
+      ansible.builtin.assert:
+        that:
+          - item.rc == 0
+          - item.stdout | trim | length > 0
+        fail_msg: >-
+          Could not read an SSH host key for {{ item.item.name }} at
+          {{ project_eip_addresses[item.item.name].public_ip }}.
+      loop: "{{ scanned_ssh_host_keys.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Write the project-scoped SSH host key file
+      ansible.builtin.copy:
+        content: >-
+          {{ scanned_ssh_host_keys.results | map(attribute='stdout') | join('\n') }}
+        dest: "{{ playbook_dir }}/../inventories/dev/known_hosts"
+        mode: "0600"
+
+    - name: Generate non-secret development inventory
+      ansible.builtin.template:
+        src: hosts.yml.j2
+        dest: "{{ playbook_dir }}/../inventories/dev/hosts.yml"
+        mode: "0600"
+
+    - name: Reload generated inventory
+      ansible.builtin.meta: refresh_inventory

@@ -1,0 +1,12 @@
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata: {name: react-demo, namespace: argocd}
+spec:
+  description: Scoped React demo delivery
+  sourceRepos: ["{{ gitops_repository_url }}"]
+  destinations:
+    - {namespace: react-dev, server: https://kubernetes.default.svc}
+    - {namespace: react-prod, server: https://kubernetes.default.svc}
+  namespaceResourceWhitelist: [{group: "*", kind: "*"}]
+

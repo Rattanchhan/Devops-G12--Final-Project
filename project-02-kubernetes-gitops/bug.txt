@@ -1,0 +1,31 @@
+
+(.venv) ubuntu@ip-172-31-89-54:~/project-02-kubernetes-gitops$ just publish-react dev "Publish React application"
+Cloning into '/tmp/project02-publish.R6z0bN'...
+remote: Enumerating objects: 149, done.
+remote: Counting objects: 100% (149/149), done.
+remote: Compressing objects: 100% (106/106), done.
+remote: Total 149 (delta 32), reused 133 (delta 19), pack-reused 0 (from 0)
+Receiving objects: 100% (149/149), 102.16 KiB | 20.43 MiB/s, done.
+Resolving deltas: 100% (32/32), done.
+[dev e37d0fb] Publish React application
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+Missing or invalid credentials.
+Error: connect ECONNREFUSED /run/user/1000/vscode-git-4ee0de1beb.sock
+    at PipeConnectWrap.afterConnect [as oncomplete] (node:net:2021:16) {
+  errno: -111,
+  code: 'ECONNREFUSED',
+  syscall: 'connect',
+  address: '/run/user/1000/vscode-git-4ee0de1beb.sock'
+}
+Missing or invalid credentials.
+Error: connect ECONNREFUSED /run/user/1000/vscode-git-4ee0de1beb.sock
+    at PipeConnectWrap.afterConnect [as oncomplete] (node:net:2021:16) {
+  errno: -111,
+  code: 'ECONNREFUSED',
+  syscall: 'connect',
+  address: '/run/user/1000/vscode-git-4ee0de1beb.sock'
+}
+remote: No anonymous write access.
+fatal: Authentication failed for 'https://github.com/Rattanchhan/reactjs-service-pipeline.git/'
+error: Recipe `_publish-directory` failed with exit code 128
+error: Recipe `publish-react` failed on line 17 with exit code 128

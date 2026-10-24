@@ -1,0 +1,5 @@
+---
+service_domain: "{{ sonarqube_domain }}"
+service_upstream_port: 9000
+service_compose_project: sonarqube
+service_containers: [sonarqube, sonarqube-db]

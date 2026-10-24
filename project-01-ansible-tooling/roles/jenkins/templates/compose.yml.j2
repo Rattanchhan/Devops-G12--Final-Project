@@ -1,0 +1,26 @@
+services:
+  jenkins:
+    image: project01-jenkins:local
+    build:
+      context: .
+    container_name: jenkins
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      CASC_JENKINS_CONFIG: /var/jenkins_home/casc/jenkins.yaml
+      JENKINS_ADMIN_PASSWORD: {{ vault_jenkins_admin_password | to_json }}
+      JENKINS_AGENT_PRIVATE_KEY: {{ vault_jenkins_agent_private_key | to_json }}
+      JAVA_OPTS: -Djenkins.install.runSetupWizard=false
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - ./casc:/var/jenkins_home/casc:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/login >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+volumes:
+  jenkins_home:
+

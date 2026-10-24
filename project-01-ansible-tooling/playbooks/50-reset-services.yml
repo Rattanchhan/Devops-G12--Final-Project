@@ -1,0 +1,16 @@
+---
+- name: Safely recreate service containers without deleting volumes
+  hosts: jenkins:sonarqube:nexus
+  become: true
+  vars:
+    confirm_service_reset: false
+  tasks:
+    - name: Require reset confirmation
+      ansible.builtin.assert:
+        that: confirm_service_reset | bool
+        fail_msg: Rerun with -e confirm_service_reset=true.
+    - name: Reconcile Compose services while preserving volumes
+      community.docker.docker_compose_v2:
+        project_src: "/opt/{{ service_compose_project }}"
+        state: present
+        recreate: always

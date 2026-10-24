@@ -1,0 +1,96 @@
+---
+- name: Validate SonarQube secrets
+  ansible.builtin.assert:
+    that:
+      - vault_sonarqube_db_password != 'CHANGE_ME'
+      - vault_sonarqube_admin_password != 'CHANGE_ME'
+      - vault_sonarqube_admin_password | length >= 12
+      - vault_sonarqube_admin_password | regex_search('[A-Z]') is not none
+      - vault_sonarqube_admin_password | regex_search('[a-z]') is not none
+      - vault_sonarqube_admin_password | regex_search('[0-9]') is not none
+      - vault_sonarqube_admin_password | regex_search('[^A-Za-z0-9]') is not none
+    fail_msg: >-
+      Configure encrypted SonarQube secrets. The administrator password must
+      contain at least 12 characters, including uppercase, lowercase, numeric,
+      and special characters.
+- name: Configure SonarQube kernel requirements
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    state: present
+    sysctl_set: true
+  loop:
+    - {name: vm.max_map_count, value: "524288"}
+    - {name: fs.file-max, value: "131072"}
+- name: Create SonarQube project directory
+  ansible.builtin.file:
+    path: /opt/sonarqube
+    state: directory
+    mode: "0750"
+- name: Render SonarQube Compose project
+  ansible.builtin.template:
+    src: compose.yml.j2
+    dest: /opt/sonarqube/compose.yml
+    mode: "0600"
+  no_log: true
+  notify: Reconcile SonarQube
+- name: Reconcile SonarQube now
+  ansible.builtin.meta: flush_handlers
+- name: Wait for SonarQube readiness
+  ansible.builtin.uri:
+    url: http://127.0.0.1:9000/api/system/status
+    status_code: 200
+    return_content: true
+  register: sonarqube_status
+  retries: 60
+  delay: 10
+  until:
+    - sonarqube_status.status | default(0) == 200
+    - sonarqube_status.get('json', {}).get('status', '') == 'UP'
+- name: Check configured SonarQube administrator credentials
+  ansible.builtin.uri:
+    url: http://127.0.0.1:9000/api/authentication/validate
+    user: admin
+    password: "{{ vault_sonarqube_admin_password }}"
+    force_basic_auth: true
+    status_code: 200
+  register: sonarqube_configured_auth
+  no_log: true
+
+- name: Check default SonarQube administrator credentials
+  ansible.builtin.uri:
+    url: http://127.0.0.1:9000/api/authentication/validate
+    user: admin
+    password: admin
+    force_basic_auth: true
+    status_code: 200
+  register: sonarqube_default_auth
+  when: not sonarqube_configured_auth.json.valid | default(false) | bool
+  no_log: true
+
+- name: Validate known SonarQube administrator credentials
+  ansible.builtin.assert:
+    that:
+      - >-
+        sonarqube_configured_auth.json.valid | default(false) | bool or
+        sonarqube_default_auth.json.valid | default(false) | bool
+    fail_msg: >-
+      Neither the configured Vault password nor the default password can
+      authenticate the SonarQube administrator. Update
+      vault_sonarqube_admin_password to the current administrator password.
+
+- name: Rotate default SonarQube administrator password
+  ansible.builtin.uri:
+    url: http://127.0.0.1:9000/api/users/change_password
+    method: POST
+    user: admin
+    password: admin
+    force_basic_auth: true
+    body_format: form-urlencoded
+    body:
+      login: admin
+      previousPassword: admin
+      password: "{{ vault_sonarqube_admin_password }}"
+    status_code: 204
+  when: not sonarqube_configured_auth.json.valid | default(false) | bool
+  no_log: true

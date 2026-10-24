@@ -1,0 +1,58 @@
+---
+- name: Guarded destruction of Project 01 EC2 instances
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../inventories/dev/group_vars/all/main.yml
+  vars:
+    confirm_destroy: false
+    allowed_destroy_environments:
+      - dev
+      - test
+  tasks:
+    - name: Validate destroy scope
+      ansible.builtin.assert:
+        that:
+          - target_environment in allowed_destroy_environments
+          - project_tag == 'devops-g12-p1'
+        fail_msg: Destruction is restricted to explicitly allowed Project 01 environments.
+
+    - name: Discover only project-owned instances
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Project": "{{ project_tag }}"
+          "tag:Environment": "{{ target_environment }}"
+          "tag:ManagedBy": Ansible
+          instance-state-name:
+            - pending
+            - running
+            - stopping
+            - stopped
+      register: destroy_candidates
+
+    - name: Print exact destroy candidates
+      ansible.builtin.debug:
+        msg: >-
+          {{ destroy_candidates.instances | map(attribute='instance_id') | list }}
+
+    - name: Require explicit confirmation
+      ansible.builtin.assert:
+        that:
+          - confirm_destroy | bool
+        fail_msg: Review the instance IDs above, then rerun with -e confirm_destroy=true.
+
+    - name: Terminate confirmed project instances
+      amazon.aws.ec2_instance:
+        region: "{{ aws_region }}"
+        instance_ids: "{{ destroy_candidates.instances | map(attribute='instance_id') | list }}"
+        state: absent
+        wait: true
+      when: destroy_candidates.instances | length > 0
+
+    - name: Remove the project security group after instances terminate
+      amazon.aws.ec2_security_group:
+        name: "{{ project_tag }}-{{ target_environment }}"
+        region: "{{ aws_region }}"
+        state: absent

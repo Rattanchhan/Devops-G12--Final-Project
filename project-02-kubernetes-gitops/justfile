@@ -1,0 +1,360 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+venv := "infra/.venv"
+playbook := venv + "/bin/ansible-playbook"
+inventory := "infra/kubespray/inventory/project02/hosts.yml"
+vault_file := "infra/vault.yml"
+vault_example := "infra/vault.yml.example"
+vault_command := venv + "/bin/ansible-vault"
+react_repository := "https://github.com/Rattanchhan/reactjs-service-pipeline.git"
+gitops_repository := "https://github.com/Rattanchhan/argocd-gitops-repository.git"
+
+default:
+    @just --list
+
+# Publish the React source directory as the root of its dedicated repository.
+publish-react branch="dev" message="Publish React application":
+    @just _publish-directory reactjs-service-pipeline-deployment {{ react_repository }} "{{ branch }}" "{{ message }}"
+
+# Wait for React CI, including its direct GitOps promotion, to finish.
+wait-react-ci branch="dev" timeout_seconds="1800":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target_branch="{{ branch }}"
+    timeout="{{ timeout_seconds }}"
+    case "$timeout" in (*[!0-9]*|'') echo "timeout_seconds must be a positive integer." >&2; exit 1;; esac
+    test "$timeout" -gt 0 || { echo "timeout_seconds must be greater than zero." >&2; exit 1; }
+    sha="$(git ls-remote {{ react_repository }} "refs/heads/$target_branch" | awk 'NR == 1 {print $1}')"
+    test -n "$sha" || { echo "Unable to resolve React branch: $target_branch" >&2; exit 1; }
+    deadline=$((SECONDS + timeout))
+    api="https://api.github.com/repos/Rattanchhan/reactjs-service-pipeline/actions/runs?head_sha=$sha&per_page=10"
+    while (( SECONDS < deadline )); do
+      response="$(curl -fsS -H 'Accept: application/vnd.github+json' "$api")"
+      run="$(printf '%s' "$response" | infra/.venv/bin/python -c 'import json,sys; runs=json.load(sys.stdin).get("workflow_runs", []); r=runs[0] if runs else {}; print("\t".join(str(r.get(k) or "") for k in ("status", "conclusion", "html_url")))')"
+      IFS=$'\t' read -r status conclusion url <<< "$run"
+      if [[ "$status" == completed ]]; then
+        echo "React CI completed: $conclusion ${url:-}"
+        [[ "$conclusion" == success ]]
+        exit
+      fi
+      echo "Waiting for React CI on $target_branch ($sha): ${status:-not registered yet}"
+      sleep 30
+    done
+    echo "Timed out waiting for React CI on $target_branch ($sha)." >&2
+    exit 1
+
+# Publish the desired-state directory as the root of its dedicated repository.
+publish-gitops branch="main" message="Publish GitOps desired state":
+    @just _publish-directory argocd-gitops-repository {{ gitops_repository }} "{{ branch }}" "{{ message }}"
+
+# Publish both repositories with the GitHub token stored in Ansible Vault.
+[private]
+_publish-from-vault:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    file="{{ vault_file }}"
+    python="{{ venv }}/bin/python"
+    vault="{{ vault_command }}"
+    [[ -s "$file" ]] || { echo "$file is missing or empty." >&2; exit 1; }
+    [[ -x "$python" ]] || { echo "Run 'just setup' first." >&2; exit 1; }
+    read_token=("$python" -c 'import sys,yaml; data=yaml.safe_load(sys.stdin); value=data.get("vault_github_webhook_token", "") if isinstance(data, dict) else ""; sys.stdout.write(str(value))')
+    if IFS= read -r first_line < "$file" && [[ "$first_line" == \$ANSIBLE_VAULT\;* ]]; then
+      [[ -x "$vault" ]] || { echo "Run 'just setup' first." >&2; exit 1; }
+      token="$("$vault" view --ask-vault-pass "$file" | "${read_token[@]}")"
+    else
+      token="$("${read_token[@]}" < "$file")"
+    fi
+    if [[ -z "$token" || "$token" == *CHANGE_ME* ]]; then
+      echo "vault_github_webhook_token is missing or still a placeholder." >&2
+      exit 1
+    fi
+    GH_TOKEN="$token" just publish-gitops main "Publish GitOps desired state"
+    GH_TOKEN="$token" just publish-react dev "Publish React application"
+    unset token
+
+# Internal helper used by the repository publication recipes.
+[private]
+_publish-directory source repository branch message:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source_dir="{{ source }}"
+    repository_url="{{ repository }}"
+    target_branch="{{ branch }}"
+    commit_message="{{ message }}"
+    test -d "$source_dir" || { echo "Missing source directory: $source_dir" >&2; exit 1; }
+    test -n "$target_branch" || { echo "Branch must not be empty." >&2; exit 1; }
+    test -n "$commit_message" || { echo "Commit message must not be empty." >&2; exit 1; }
+    command -v git >/dev/null || { echo "git is required." >&2; exit 1; }
+    command -v rsync >/dev/null || { echo "rsync is required." >&2; exit 1; }
+    temp_dir="$(mktemp -d /tmp/project02-publish.XXXXXX)"
+    cleanup() {
+      if [[ -n "${askpass:-}" && "$askpass" == /tmp/project02-publish.*.git-askpass ]]; then
+        rm -f -- "$askpass"
+      fi
+      test -n "$temp_dir" && [[ "$temp_dir" == /tmp/project02-publish.* ]] && rm -rf -- "$temp_dir"
+    }
+    trap cleanup EXIT
+    git_auth=()
+    github_token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+    if [[ -n "$github_token" && "$repository_url" == https://github.com/* ]]; then
+      askpass="$temp_dir.git-askpass"
+      cat > "$askpass" <<'EOF'
+    #!/usr/bin/env bash
+    case "$1" in
+      *Username*) printf '%s\n' "${GITHUB_ACTOR:-x-access-token}" ;;
+      *Password*) printf '%s\n' "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ;;
+    esac
+    EOF
+      chmod 700 "$askpass"
+      git_auth=(env GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0)
+    fi
+    if ! "${git_auth[@]}" git clone --branch "$target_branch" --single-branch "$repository_url" "$temp_dir"; then
+      echo "Unable to clone $repository_url. Configure Git credentials or export GH_TOKEN/GITHUB_TOKEN with repository access." >&2
+      exit 1
+    fi
+    declare -A promoted_names=() promoted_digests=()
+    if [[ "$source_dir" == argocd-gitops-repository ]]; then
+      for environment in dev prod; do
+        file="environments/$environment/kustomization.yaml"
+        if git -C "$temp_dir" cat-file -e "HEAD:$file" 2>/dev/null; then
+          remote_file="$(git -C "$temp_dir" show "HEAD:$file")"
+          promoted_name="$(sed -n 's/^[[:space:]]*newName:[[:space:]]*//p' <<< "$remote_file" | head -n 1)"
+          promoted_digest="$(sed -n 's/^[[:space:]]*digest:[[:space:]]*//p' <<< "$remote_file" | head -n 1)"
+          if [[ "$promoted_name" != *REPLACE_OWNER* && "$promoted_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            promoted_names["$environment"]="$promoted_name"
+            promoted_digests["$environment"]="$promoted_digest"
+          fi
+        fi
+      done
+    fi
+    rsync -a --delete --exclude=.git "$source_dir"/ "$temp_dir"/
+    for environment in "${!promoted_names[@]}"; do
+      file="$temp_dir/environments/$environment/kustomization.yaml"
+      [[ -f "$file" ]] || continue
+      sed -i -E \
+        -e "s#^([[:space:]]*newName:)[[:space:]]*.*#\\1 ${promoted_names[$environment]}#" \
+        -e "s#^([[:space:]]*digest:)[[:space:]]*.*#\\1 ${promoted_digests[$environment]}#" \
+        "$file"
+    done
+    git -C "$temp_dir" diff --check
+    git -C "$temp_dir" add -A
+    if git -C "$temp_dir" diff --cached --quiet; then
+      echo "No changes to publish to $repository_url ($target_branch)."
+      exit 0
+    fi
+    git -C "$temp_dir" config user.name "$(git config user.name || echo 'Project 02 Publisher')"
+    git -C "$temp_dir" config user.email "$(git config user.email || echo 'project-02-publisher@users.noreply.github.com')"
+    git -C "$temp_dir" commit -m "$commit_message"
+    if ! "${git_auth[@]}" git -C "$temp_dir" push origin "$target_branch"; then
+      echo "Unable to push to $repository_url. Configure Git credentials or export GH_TOKEN/GITHUB_TOKEN with repository write access." >&2
+      exit 1
+    fi
+    echo "Published $source_dir to $repository_url ($target_branch)."
+
+# Install the vendored Kubespray and Project 02 controller dependencies.
+setup:
+    infra/scripts/install-kubespray.sh
+
+# Report whether the local Vault file is missing, plaintext, or encrypted.
+vault-status:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    file="{{ vault_file }}"
+    if [[ ! -e "$file" ]]; then
+      echo "Vault status: missing ($file)"
+    elif [[ ! -s "$file" ]]; then
+      echo "Vault status: empty ($file)"
+    elif IFS= read -r first_line < "$file" && [[ "$first_line" == \$ANSIBLE_VAULT\;* ]]; then
+      echo "Vault status: encrypted ($file)"
+    else
+      echo "Vault status: PLAINTEXT ($file) — run 'just vault-encrypt'."
+    fi
+
+# Initialize the Vault file when missing, then encrypt it in place.
+vault-encrypt:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command="{{ vault_command }}"
+    file="{{ vault_file }}"
+    example="{{ vault_example }}"
+    [[ -x "$command" ]] || { echo "Run 'just setup' first." >&2; exit 1; }
+    if [[ ! -e "$file" ]]; then
+      cp "$example" "$file"
+      chmod 600 "$file"
+      echo "Created $file from $example."
+    fi
+    [[ -s "$file" ]] || { echo "$file is empty; refusing to encrypt it." >&2; exit 1; }
+    if IFS= read -r first_line < "$file" && [[ "$first_line" == \$ANSIBLE_VAULT\;* ]]; then
+      echo "$file is already encrypted."
+      exit 0
+    fi
+    "$command" encrypt "$file"
+    chmod 600 "$file"
+    echo "Encrypted $file. Use 'just vault-edit' to replace placeholders."
+
+# Decrypt the Vault file in place; leaves secrets as local plaintext.
+vault-decrypt:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command="{{ vault_command }}"
+    file="{{ vault_file }}"
+    [[ -x "$command" ]] || { echo "Run 'just setup' first." >&2; exit 1; }
+    [[ -s "$file" ]] || { echo "$file is missing or empty." >&2; exit 1; }
+    IFS= read -r first_line < "$file"
+    if [[ "$first_line" != \$ANSIBLE_VAULT\;* ]]; then
+      echo "$file is already plaintext."
+      exit 0
+    fi
+    "$command" decrypt "$file"
+    chmod 600 "$file"
+    echo "WARNING: $file now contains plaintext secrets. Re-encrypt it promptly."
+
+# Securely edit the encrypted Vault file without leaving a plaintext copy.
+vault-edit:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command="{{ vault_command }}"
+    file="{{ vault_file }}"
+    [[ -x "$command" ]] || { echo "Run 'just setup' first." >&2; exit 1; }
+    [[ -s "$file" ]] || { echo "$file is missing; run 'just vault-encrypt' first." >&2; exit 1; }
+    IFS= read -r first_line < "$file"
+    [[ "$first_line" == \$ANSIBLE_VAULT\;* ]] || {
+      echo "$file is plaintext; run 'just vault-encrypt' first." >&2
+      exit 1
+    }
+    "$command" edit "$file"
+
+# Generate a 256-bit shared secret for vault_argocd_webhook_secret.
+generate-webhook-secret:
+    @command -v openssl >/dev/null || { echo "openssl is required." >&2; exit 1; }
+    @openssl rand -hex 32
+
+# Compatibility aliases for the requested misspelling.
+vautl-status: vault-status
+
+vautl-encrypt: vault-encrypt
+
+# Create the Project 02 SSH key when it does not already exist.
+key-init:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    config="../project-01-ansible-tooling/inventories/dev/group_vars/all/main.yml"
+    test -f "$config" || { echo "Project 1 shared inventory is missing." >&2; exit 1; }
+    key_path="$({{ venv }}/bin/python -c 'import sys,yaml; print(yaml.safe_load(open(sys.argv[1]))["aws_ssh_private_key_file"])' "$config")"
+    test -n "$key_path" && [[ "$key_path" != "/" ]] || { echo "Unsafe key path." >&2; exit 1; }
+    if [[ -f "$key_path" ]]; then
+      test -f "$key_path.pub" || ssh-keygen -y -f "$key_path" > "$key_path.pub"
+    else
+      mkdir -p "$(dirname "$key_path")"
+      ssh-keygen -q -t ed25519 -N "" -C "shared-devops-g12-key" -f "$key_path"
+    fi
+    chmod 600 "$key_path"
+    chmod 644 "$key_path.pub"
+
+# Run syntax checks for Project 02 wrappers without contacting cloud or nodes.
+syntax:
+    test -x {{ playbook }} || { echo "Run 'just setup' first." >&2; exit 1; }
+    test -f {{ inventory }} || cp {{ inventory }}.example {{ inventory }}
+    cd infra && .venv/bin/ansible-playbook playbooks/10-prerequisites.yml --syntax-check
+    cd infra && .venv/bin/ansible-playbook playbooks/20-kubespray.yml --syntax-check
+    cd infra && .venv/bin/ansible-playbook playbooks/30-master02-workloads.yml --syntax-check
+    cd infra && .venv/bin/ansible-playbook playbooks/32-aws-nlb.yml --syntax-check
+    cd infra && .venv/bin/ansible-playbook playbooks/35-platform.yml --syntax-check
+    cd infra && .venv/bin/ansible-playbook playbooks/36-gitops-bootstrap.yml --syntax-check
+    cd infra && .venv/bin/ansible-playbook playbooks/40-verify.yml --syntax-check
+
+# Generate the Kubespray inventory by referencing Project 1's four instances.
+inventory:
+    cd infra && .venv/bin/ansible-playbook playbooks/00-reuse-project1-inventory.yml
+
+# Verify SSH connectivity through the generated inventory.
+ping:
+    cd infra && .venv/bin/ansible all -m ansible.builtin.ping
+
+# Prepare clean hosts and build the cluster using the vendored Kubespray copy.
+cluster: inventory
+    ../project-01-ansible-tooling/.venv/bin/ansible-playbook ../project-01-ansible-tooling/playbooks/60-transition-project2.yml -e confirm_project2_transition=true
+    cd infra && .venv/bin/ansible-playbook playbooks/10-prerequisites.yml -e confirm_in_place_migration=true
+    # Invoke Kubespray directly so its task output is streamed to the terminal.
+    cd infra/kubespray && ../.venv/bin/ansible-playbook -i inventory/project02/hosts.yml -b cluster.yml
+
+# Install workload policy, NLB routing, Traefik, cert-manager, Headlamp and Argo CD.
+platform:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    infra/scripts/with-kubeconfig-tunnel.sh bash -euo pipefail -c '
+      cd infra
+      .venv/bin/ansible-playbook playbooks/30-master02-workloads.yml
+      .venv/bin/ansible-playbook playbooks/35-platform.yml
+      .venv/bin/ansible-playbook playbooks/32-aws-nlb.yml
+    '
+
+# Register the GitOps repository and create the Argo CD application.
+gitops:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ ! -s infra/vault.yml ]]; then
+      echo "Create and encrypt infra/vault.yml before bootstrapping Argo CD." >&2
+      exit 1
+    fi
+    vault_args=(--ask-vault-pass)
+    infra/scripts/with-kubeconfig-tunnel.sh bash -euo pipefail -c '
+      cd infra
+      .venv/bin/ansible-playbook playbooks/36-gitops-bootstrap.yml "$@"
+    ' bash "${vault_args[@]}"
+
+# Print the initial Argo CD administrator password.
+argocd-credentials:
+    bash infra/scripts/argocd-initial-admin-password.sh
+
+# Apply webhook.github.secret and synchronize the GitHub repository webhook.
+argocd-webhook-secret:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ ! -s "{{ vault_file }}" ]]; then
+      echo "{{ vault_file }} is missing; run 'just vault-encrypt' first." >&2
+      exit 1
+    fi
+    IFS= read -r first_line < "{{ vault_file }}"
+    if [[ "$first_line" != \$ANSIBLE_VAULT\;* ]]; then
+      echo "{{ vault_file }} is plaintext; run 'just vault-encrypt' first." >&2
+      exit 1
+    fi
+    infra/scripts/with-kubeconfig-tunnel.sh bash -euo pipefail -c '
+      cd infra
+      .venv/bin/ansible-playbook playbooks/36-gitops-bootstrap.yml \
+        --ask-vault-pass --tags credentials
+    '
+
+# Verify token authentication, GitOps repository access, and Webhooks access.
+github-webhook-access:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ ! -s "{{ vault_file }}" ]]; then
+      echo "{{ vault_file }} is missing; run 'just vault-encrypt' first." >&2
+      exit 1
+    fi
+    IFS= read -r first_line < "{{ vault_file }}"
+    if [[ "$first_line" != \$ANSIBLE_VAULT\;* ]]; then
+      echo "{{ vault_file }} is plaintext; run 'just vault-encrypt' first." >&2
+      exit 1
+    fi
+    cd infra
+    .venv/bin/ansible-playbook playbooks/37-verify-github-webhook-access.yml \
+      --ask-vault-pass
+
+# Print a short-lived Headlamp viewer token (valid for one hour).
+headlamp-token:
+    infra/scripts/with-kubeconfig-tunnel.sh infra/.venv/bin/python infra/scripts/headlamp-token.py
+
+# Run the cluster acceptance checks.
+verify:
+    infra/scripts/with-kubeconfig-tunnel.sh bash -euo pipefail -c 'cd infra && .venv/bin/ansible-playbook playbooks/40-verify.yml'
+
+# Complete every post-cluster stage, publishing both repository-ready trees.
+complete:
+    just platform
+    just _publish-from-vault
+    just wait-react-ci dev
+    just gitops
+    just verify

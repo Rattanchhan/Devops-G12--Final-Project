@@ -1,0 +1,56 @@
+---
+- name: Validate Jenkins secrets
+  ansible.builtin.assert:
+    that:
+      - vault_jenkins_admin_password != 'CHANGE_ME'
+      - vault_jenkins_agent_private_key != 'CHANGE_ME'
+    fail_msg: Configure encrypted Jenkins secrets in vault.yml.
+
+- name: Create Jenkins project directory
+  ansible.builtin.file:
+    path: /opt/jenkins
+    state: directory
+    mode: "0750"
+
+- name: Create Jenkins configuration directory
+  ansible.builtin.file:
+    path: /opt/jenkins/casc
+    state: directory
+    owner: "1000"
+    group: "1000"
+    mode: "0750"
+
+- name: Render Jenkins Compose project
+  ansible.builtin.template:
+    src: compose.yml.j2
+    dest: /opt/jenkins/compose.yml
+    mode: "0600"
+  notify: Reconcile Jenkins
+  no_log: true
+
+- name: Install pinned Jenkins plugin manifest
+  ansible.builtin.copy:
+    src: plugins.txt
+    dest: /opt/jenkins/plugins.txt
+    mode: "0644"
+  notify: Reconcile Jenkins
+
+- name: Install Jenkins image definition
+  ansible.builtin.template:
+    src: Dockerfile.j2
+    dest: /opt/jenkins/Dockerfile
+    mode: "0644"
+  notify: Reconcile Jenkins
+
+- name: Render Jenkins configuration as code
+  ansible.builtin.template:
+    src: jenkins.yaml.j2
+    dest: /opt/jenkins/casc/jenkins.yaml
+    owner: "1000"
+    group: "1000"
+    mode: "0600"
+  notify: Reconcile Jenkins
+  no_log: true
+
+- name: Reconcile Jenkins now
+  ansible.builtin.meta: flush_handlers

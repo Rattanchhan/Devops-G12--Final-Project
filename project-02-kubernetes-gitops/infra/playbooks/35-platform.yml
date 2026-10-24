@@ -1,0 +1,279 @@
+---
+- name: Install Kubernetes platform components
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../../../project-01-ansible-tooling/inventories/dev/group_vars/all/main.yml
+    - ../versions.yml
+    - ../platform-config.yml
+  vars:
+    kubeconfig_path: "{{ lookup('env', 'KUBECONFIG') }}"
+    root_dir: "{{ playbook_dir }}/../.."
+    helm_binary: "{{ playbook_dir }}/../bin/helm"
+  tasks:
+    - name: Require the encrypted credential vault before platform installation
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../vault.yml"
+      register: platform_vault
+    - name: Refuse platform installation without encrypted credentials
+      ansible.builtin.assert:
+        that:
+          - platform_vault.stat.exists
+          - platform_vault.stat.size | int > 0
+        fail_msg: >-
+          Copy infra/vault.yml.example to infra/vault.yml, set the credentials,
+          and encrypt it with ansible-vault before installing Headlamp or Argo CD.
+    - name: Require kubeconfig
+      ansible.builtin.assert:
+        that:
+          - kubeconfig_path | length > 0
+          - acme_email != 'admin@example.com'
+          - "'.example.com' not in headlamp_domain"
+          - "'.example.com' not in argocd_domain"
+    - name: Add Helm repositories
+      kubernetes.core.helm_repository:
+        name: "{{ item.name }}"
+        repo_url: "{{ item.url }}"
+        binary_path: "{{ helm_binary }}"
+      loop:
+        - {name: traefik, url: https://traefik.github.io/charts}
+        - {name: jetstack, url: https://charts.jetstack.io}
+        - {name: headlamp, url: https://kubernetes-sigs.github.io/headlamp/}
+        - {name: argo, url: https://argoproj.github.io/argo-helm}
+    - name: Refresh Helm repository indexes
+      ansible.builtin.command:
+        argv: ["{{ helm_binary }}", repo, update]
+      changed_when: false
+    - name: Read the public ingress NLB endpoint
+      ansible.builtin.command:
+        argv:
+          - aws
+          - elbv2
+          - describe-load-balancers
+          - --names
+          - "{{ aws_nlb_name }}"
+          - --region
+          - "{{ aws_region }}"
+          - --query
+          - LoadBalancers[0].DNSName
+          - --output
+          - text
+      changed_when: false
+      register: ingress_nlb_dns
+    - name: Validate the public ingress NLB endpoint
+      ansible.builtin.assert:
+        that:
+          - ingress_nlb_dns.stdout | length > 0
+          - ingress_nlb_dns.stdout != 'None'
+    - name: Install Traefik
+      kubernetes.core.helm:
+        binary_path: "{{ helm_binary }}"
+        kubeconfig: "{{ kubeconfig_path }}"
+        name: traefik
+        chart_ref: traefik/traefik
+        chart_version: "{{ traefik_chart_version }}"
+        update_repo_cache: true
+        release_namespace: traefik
+        create_namespace: true
+        values_files: ["{{ root_dir }}/argocd-gitops-repository/platform/traefik/values.yaml"]
+        set_values:
+          - {value: providers.kubernetesIngress.publishedService.enabled=false}
+          - value: >-
+              additionalArguments[0]=--providers.kubernetesingress.ingressendpoint.hostname={{
+              ingress_nlb_dns.stdout | lower }}
+            value_type: string
+        wait: true
+    - name: Check for an existing cert-manager Helm release
+      ansible.builtin.command:
+        argv: ["{{ helm_binary }}", status, cert-manager, --namespace, cert-manager]
+      environment: {KUBECONFIG: "{{ kubeconfig_path }}"}
+      changed_when: false
+      failed_when: false
+      register: cert_manager_helm_status
+    - name: Adopt the Kubespray cert-manager installation into Helm
+      ansible.builtin.command:
+        argv:
+          - "{{ helm_binary }}"
+          - upgrade
+          - --install
+          - --take-ownership
+          - --wait
+          - --create-namespace
+          - --namespace
+          - cert-manager
+          - --version
+          - "{{ cert_manager_chart_version }}"
+          - --set
+          - crds.enabled=true
+          - cert-manager
+          - jetstack/cert-manager
+      environment: {KUBECONFIG: "{{ kubeconfig_path }}"}
+      when: cert_manager_helm_status.rc != 0
+    - name: Install cert-manager
+      kubernetes.core.helm:
+        binary_path: "{{ helm_binary }}"
+        kubeconfig: "{{ kubeconfig_path }}"
+        name: cert-manager
+        chart_ref: jetstack/cert-manager
+        chart_version: "{{ cert_manager_chart_version }}"
+        release_namespace: cert-manager
+        create_namespace: true
+        set_values: [{value: crds.enabled=true}]
+        take_ownership: true
+        wait: true
+    - name: Configure staging and production ACME issuers
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        definition:
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata: {name: "{{ item.name }}"}
+          spec:
+            acme:
+              email: "{{ acme_email }}"
+              server: "{{ item.server }}"
+              privateKeySecretRef: {name: "{{ item.name }}-account"}
+              solvers:
+                - http01: {ingress: {ingressClassName: traefik}}
+      loop:
+        - {name: letsencrypt-staging, server: "https://acme-staging-v02.api.letsencrypt.org/directory"}
+        - {name: letsencrypt-prod, server: "https://acme-v02.api.letsencrypt.org/directory"}
+    - name: Install Headlamp
+      kubernetes.core.helm:
+        binary_path: "{{ helm_binary }}"
+        kubeconfig: "{{ kubeconfig_path }}"
+        name: headlamp
+        chart_ref: headlamp/headlamp
+        chart_version: "{{ headlamp_chart_version }}"
+        release_namespace: headlamp
+        create_namespace: true
+        values_files: ["{{ root_dir }}/argocd-gitops-repository/platform/headlamp/values.yaml"]
+        set_values:
+          - {value: "ingress.hosts[0].host={{ headlamp_domain }}", value_type: string}
+          - {value: "ingress.tls[0].hosts[0]={{ headlamp_domain }}", value_type: string}
+        wait: true
+    - name: Ensure application namespaces exist for scoped viewer RBAC
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        src: "{{ root_dir }}/argocd-gitops-repository/base/namespace.yaml"
+    - name: Apply least-privilege Headlamp viewer RBAC
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        src: "{{ root_dir }}/argocd-gitops-repository/platform/headlamp/viewer-rbac.yaml"
+    - name: Detect an existing Kubespray Argo CD installation
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: argocd
+        name: argocd-server
+      register: existing_argocd
+    - name: Read the existing Argo CD server service
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: v1
+        kind: Service
+        namespace: argocd
+        name: argocd-server
+      register: existing_argocd_service
+    - name: Install Argo CD
+      kubernetes.core.helm:
+        binary_path: "{{ helm_binary }}"
+        kubeconfig: "{{ kubeconfig_path }}"
+        name: argocd
+        chart_ref: argo/argo-cd
+        chart_version: "{{ argocd_chart_version }}"
+        release_namespace: argocd
+        create_namespace: true
+        values_files: ["{{ root_dir }}/argocd-gitops-repository/platform/argocd/values.yaml"]
+        set_values:
+          - {value: "global.domain={{ argocd_domain }}", value_type: string}
+          - {value: "server.ingress.hostname={{ argocd_domain }}", value_type: string}
+        take_ownership: true
+        wait: true
+      when: existing_argocd.resources | length == 0
+    - name: Preserve the Kubespray Argo CD server service selector
+      kubernetes.core.k8s_json_patch:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: v1
+        kind: Service
+        namespace: argocd
+        name: argocd-server
+        patch:
+          - op: remove
+            path: /spec/selector/app.kubernetes.io~1instance
+      when:
+        - existing_argocd.resources | length > 0
+        - "'app.kubernetes.io/instance' in existing_argocd_service.resources[0].spec.selector"
+    - name: Configure Argo CD for TLS termination at Traefik
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: patched
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata: {name: argocd-cmd-params-cm, namespace: argocd}
+          data: {server.insecure: "true"}
+    - name: Enforce insecure backend mode on the preserved Argo CD server
+      kubernetes.core.k8s_json_patch:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: apps/v1
+        kind: Deployment
+        namespace: argocd
+        name: argocd-server
+        patch:
+          - op: add
+            path: /spec/template/spec/containers/0/args
+            value: >-
+              {{ (existing_argocd.resources[0].spec.template.spec.containers[0].args |
+                  default([]) + ['--insecure']) | unique }}
+      when: existing_argocd.resources | length > 0
+    - name: Restore the Redis service account after preserved-install reconciliation
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: patched
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: argocd-redis, namespace: argocd}
+          spec:
+            template:
+              spec: {serviceAccountName: argocd-redis}
+      when: existing_argocd.resources | length > 0
+    - name: Run resilient Argo CD server and repository deployments
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: patched
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: "{{ item }}", namespace: argocd}
+          spec: {replicas: 2}
+      loop: [argocd-server, argocd-repo-server]
+    - name: Expose Argo CD through Traefik with managed TLS
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: argocd-server
+            namespace: argocd
+            annotations: {cert-manager.io/cluster-issuer: letsencrypt-prod}
+          spec:
+            ingressClassName: traefik
+            tls: [{hosts: ["{{ argocd_domain }}"], secretName: argocd-server-tls}]
+            rules:
+              - host: "{{ argocd_domain }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend: {service: {name: argocd-server, port: {name: http}}}
+
+

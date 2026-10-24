@@ -1,0 +1,70 @@
+---
+- name: Verify required tooling installations
+  hosts: tooling
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Check GitHub CLI version
+      ansible.builtin.command: gh --version
+      register: gh_version
+      changed_when: false
+
+    - name: Check tree version
+      ansible.builtin.command: tree --version
+      register: tree_version
+      changed_when: false
+
+    - name: Check Oh My Zsh installation directory
+      ansible.builtin.stat:
+        path: "/home/{{ admin_user }}/.oh-my-zsh"
+      register: omz_directory
+
+    - name: Check Oh My Zsh entrypoint
+      ansible.builtin.stat:
+        path: "/home/{{ admin_user }}/.oh-my-zsh/oh-my-zsh.sh"
+      register: omz_entrypoint
+
+    - name: Check administrative user's Zsh configuration
+      ansible.builtin.stat:
+        path: "/home/{{ admin_user }}/.zshrc"
+      register: zshrc_file
+
+    - name: Assert Oh My Zsh is installed and configured
+      ansible.builtin.assert:
+        that:
+          - omz_directory.stat.isdir | default(false)
+          - omz_entrypoint.stat.isreg | default(false)
+          - zshrc_file.stat.isreg | default(false)
+        fail_msg: "Oh My Zsh is not correctly installed for {{ admin_user }}."
+        success_msg: "Oh My Zsh is installed and configured for {{ admin_user }}."
+
+    - name: Inspect Portainer container
+      community.docker.docker_container_info:
+        name: portainer
+      register: portainer_info
+      when: enable_portainer | bool
+
+    - name: Assert Portainer container is running
+      ansible.builtin.assert:
+        that:
+          - portainer_info.exists
+          - portainer_info.container.State.Running
+        fail_msg: "Portainer is enabled but its container is not running."
+        success_msg: "Portainer container is running."
+      when: enable_portainer | bool
+
+    - name: Check private Portainer HTTPS API
+      ansible.builtin.uri:
+        url: "https://{{ portainer_bind_address }}:9443/api/status"
+        method: GET
+        validate_certs: false
+        status_code: 200
+      when: enable_portainer | bool
+
+    - name: Report installed command versions
+      ansible.builtin.debug:
+        msg:
+          - "{{ gh_version.stdout_lines[0] }}"
+          - "{{ tree_version.stdout_lines[0] }}"
+          - "Portainer enabled: {{ enable_portainer | bool }}"

@@ -1,0 +1,17 @@
+services:
+  nexus:
+    image: {{ nexus_image }}
+    container_name: nexus
+    restart: unless-stopped
+    ports: ["127.0.0.1:8081:8081"]
+    environment:
+      INSTALL4J_ADD_VM_PARAMS: "-Xms1200m -Xmx1200m -XX:MaxDirectMemorySize=2g"
+    volumes: ["nexus_data:/nexus-data"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/service/rest/v1/status >/dev/null"]
+      interval: 20s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
+volumes:
+  nexus_data:

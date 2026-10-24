@@ -1,0 +1,5 @@
+---
+service_domain: "{{ nexus_domain }}"
+service_upstream_port: 8081
+service_compose_project: nexus
+service_containers: [nexus]
